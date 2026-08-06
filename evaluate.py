@@ -8,7 +8,7 @@ from loss import pointwise_huber_loss
 
 
 def registration_chamfer(source, prediction, target, eps=1e-6):
-    """Symmetric CD in the same source-normalized frame as PIVOTS."""
+    """Symmetric CD in the same source-normalized frame as GIRNet."""
     centroid = source.float().mean(dim=1, keepdim=True)
     source_centered = source.float() - centroid
     scale = torch.linalg.vector_norm(source_centered, dim=-1).amax(
@@ -20,8 +20,8 @@ def registration_chamfer(source, prediction, target, eps=1e-6):
     )
 
 
-def _stage_metric_names(pivots_arch, num_refinement_steps):
-    if pivots_arch == "legacy":
+def _stage_metric_names(GIRNet_arch, num_refinement_steps):
+    if GIRNet_arch == "legacy":
         return ["final"]
     names = ["coarse"]
     for step in range(1, num_refinement_steps + 1):
@@ -46,18 +46,71 @@ def _auxiliary_stage_loss(pred_stages, gt, weights, beta_mm):
     )
 
 
+def _batched_gather(points, indices):
+    """Gather (B, M, C) points with (B, N) long indices -> (B, N, C)."""
+    batch_index = torch.arange(points.shape[0], device=points.device).view(-1, 1)
+    return points[batch_index, indices]
+
+
+def _compute_eval_match_loss(
+    global_assignment,
+    source_global_indices,
+    target_global_xyz,
+    gt_xyz,
+    match_sigma_mm,
+):
+    """Compute L_match for evaluation (same formula as training)."""
+    if global_assignment is None or source_global_indices is None:
+        return torch.tensor(0.0, device=gt_xyz.device, dtype=torch.float32)
+
+    gt_coarse = _batched_gather(gt_xyz, source_global_indices)
+    with torch.no_grad():
+        distance2 = torch.cdist(
+            gt_coarse.float(), target_global_xyz.float(), p=2
+        ).square()
+        pseudo_target_index = distance2.argmin(dim=-1)
+        min_distance2 = distance2.gather(
+            dim=-1, index=pseudo_target_index.unsqueeze(-1)
+        ).squeeze(-1)
+        match_weight = torch.exp(
+            -min_distance2 / (2.0 * match_sigma_mm ** 2)
+        )
+
+    matched_probability = global_assignment.float().gather(
+        dim=-1, index=pseudo_target_index.unsqueeze(-1)
+    ).squeeze(-1)
+
+    L_match = -(
+        match_weight * torch.log(matched_probability.clamp_min(1e-8))
+    ).sum() / match_weight.sum().clamp_min(1e-8)
+    return L_match
+
+
 @torch.no_grad()
 def evaluate(model, loader, device, args):
     """DDP-aware validation with full-to-full stage metrics."""
     model.eval()
     stage_names = _stage_metric_names(
-        args.pivots_arch, args.num_refinement_steps
+        args.GIRNet_arch, args.num_refinement_steps
     )
 
-    # Base layout: CD, MSE, Huber, auxiliary, source squared L2,
-    # completion CD, confidence sum, point count, sample count,
-    # confidence count; followed by squared L2 for every prediction stage.
-    base_count = 10
+    # Layout:
+    # 0: reg_cd (pred vs gt)
+    # 1: reg_mse
+    # 2: reg_huber
+    # 3: aux_loss
+    # 4: source_squared_l2
+    # 5: completion_gt_cd
+    # 6: pred_completed_cd (detached metric)
+    # 7: pred_gt_cd (explicit)
+    # 8: match_loss
+    # 9: confidence_sum
+    # 10: confidence_count
+    # 11: point_count
+    # 12: sample_count
+    # 13: point_l1_sum (for MAE)
+    # 14-16: score_weight sums
+    base_count = 17
     stats = torch.zeros(
         base_count + len(stage_names),
         device=device,
@@ -98,8 +151,9 @@ def evaluate(model, loader, device, args):
             )
 
         batch_size, points_per_sample, _ = pred.shape
-        cd_target = gt if args.registration_target_mode == "gt" else completed.detach()
-        reg_cd = registration_chamfer(src, pred, cd_target)
+
+        # eval_reg_cd is ALWAYS CD(pred, gt)
+        reg_cd = registration_chamfer(src, pred, gt)
         reg_mse = F.mse_loss(pred, gt)
         reg_huber = pointwise_huber_loss(
             pred, gt, beta_mm=args.huber_beta_mm
@@ -111,22 +165,51 @@ def evaluate(model, loader, device, args):
             args.huber_beta_mm,
         )
         source_squared = (src.float() - gt.float()).square().sum(dim=-1)
-        completion_cd = symmetric_chamfer_l1_fp32(
+        completion_gt_cd = symmetric_chamfer_l1_fp32(
             completed.float(), gt.float()
         )
+        pred_completed_cd = symmetric_chamfer_l1_fp32(
+            pred.float(), completed.float()
+        )
+        pred_gt_cd = symmetric_chamfer_l1_fp32(
+            pred.float(), gt.float()
+        )
+        point_l1 = (pred.float() - gt.float()).abs().sum(dim=-1)
+
+        # Match loss (full2full_v2 only).
+        match_loss = torch.tensor(0.0, device=device)
+        if args.GIRNet_arch == "full2full_v2":
+            match_loss = _compute_eval_match_loss(
+                out.get("global_assignment"),
+                out.get("source_global_indices"),
+                out.get("target_global_xyz"),
+                gt,
+                args.match_sigma_mm,
+            )
 
         stats[0] += reg_cd.double() * batch_size
         stats[1] += reg_mse.double() * batch_size
         stats[2] += reg_huber.double() * batch_size
         stats[3] += aux_loss.double() * batch_size
         stats[4] += source_squared.sum().double()
-        stats[5] += completion_cd.double() * batch_size
+        stats[5] += completion_gt_cd.double() * batch_size
+        stats[6] += pred_completed_cd.double() * batch_size
+        stats[7] += pred_gt_cd.double() * batch_size
+        stats[8] += match_loss.double() * batch_size
+
         confidence = out.get("global_match_confidence")
         if confidence is not None:
-            stats[6] += confidence.float().sum().double()
-            stats[9] += confidence.numel()
-        stats[7] += batch_size * points_per_sample
-        stats[8] += batch_size
+            stats[9] += confidence.float().sum().double()
+            stats[10] += confidence.numel()
+        stats[11] += batch_size * points_per_sample
+        stats[12] += batch_size
+        stats[13] += point_l1.sum().double()
+
+        score_weights = out.get("score_weights")
+        if score_weights is not None:
+            stats[14] += score_weights[0].double()
+            stats[15] += score_weights[1].double()
+            stats[16] += score_weights[2].double()
 
         for index, stage_pred in enumerate(pred_stages):
             squared = (stage_pred.float() - gt.float()).square().sum(dim=-1)
@@ -135,19 +218,27 @@ def evaluate(model, loader, device, args):
     if is_dist:
         dist.all_reduce(stats, op=dist.ReduceOp.SUM)
 
-    point_count = stats[7].clamp_min(1.0)
-    sample_count = stats[8].clamp_min(1.0)
-    confidence_count = stats[9].clamp_min(1.0)
+    point_count = stats[11].clamp_min(1.0)
+    sample_count = stats[12].clamp_min(1.0)
+    confidence_count = stats[10].clamp_min(1.0)
     metrics = {
         "eval_reg_huber": (stats[2] / sample_count).item(),
         "eval_aux_stage_loss": (stats[3] / sample_count).item(),
         "eval_reg_mse": (stats[1] / sample_count).item(),
         "eval_reg_cd": (stats[0] / sample_count).item(),
         "eval_source_point_rmse": torch.sqrt(stats[4] / point_count).item(),
-        "eval_completion_cd": (stats[5] / sample_count).item(),
+        "eval_completion_gt_cd": (stats[5] / sample_count).item(),
+        "eval_pred_completed_cd": (stats[6] / sample_count).item(),
+        "eval_pred_gt_cd": (stats[7] / sample_count).item(),
+        "eval_match_loss": (stats[8] / sample_count).item(),
+        "eval_point_mae": (stats[13] / point_count).item(),
         "eval_global_match_confidence": (
-            stats[6] / confidence_count
+            stats[9] / confidence_count
         ).item(),
+        "eval_completion_cd": (stats[5] / sample_count).item(),  # backward compat
+        "score_weight_spatial": (stats[14] / sample_count).item(),
+        "score_weight_feature": (stats[15] / sample_count).item(),
+        "score_weight_geometry": (stats[16] / sample_count).item(),
     }
     for index, stage_name in enumerate(stage_names):
         metrics[f"eval_{stage_name}_point_rmse"] = torch.sqrt(

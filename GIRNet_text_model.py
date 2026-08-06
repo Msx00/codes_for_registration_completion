@@ -14,6 +14,7 @@ from models.P_V2S_Net_V5_downsampled_intraop_v2_I2P_dgcnn import (  # noqa: E402
     PV2SNetV5DownsampledIntraopV2I2PDGCNN,
 )
 from models.P_V2S_Net_Full2Full_V1 import PV2SNetFull2FullV1  # noqa: E402
+from models.P_V2S_Net_Full2Full_V2 import PV2SNetFull2FullV2  # noqa: E402
 from completion.SPAQNet.models.liver_generative_completion import (  # noqa: E402
     LiverGenerativeCompletionSPAQNet,
 )
@@ -83,6 +84,8 @@ class TextConditionedGIRNet(nn.Module):
         refinement_k=35,
         initialize_from_legacy_GIRNet=True,
         debug_refinement=False,
+        global_gate_temperature=0.02,
+        init_registration_checkpoint="",
     ):
         super().__init__()
         self.use_text = use_text
@@ -124,9 +127,25 @@ class TextConditionedGIRNet(nn.Module):
                 enc_freq_scale=1,
                 debug_refinement=debug_refinement,
             )
+        elif GIRNet_arch == "full2full_v2":
+            self.backbone = PV2SNetFull2FullV2(
+                feature_dim=50,
+                points_per_region=35,
+                global_match_level=global_match_level,
+                global_match_temperature=global_match_temperature,
+                global_match_dim=global_match_dim,
+                global_spatial_sigma=global_spatial_sigma,
+                max_coarse_flow_normalized=max_coarse_flow_normalized,
+                gate_temperature=global_gate_temperature,
+                num_refinement_steps=num_refinement_steps,
+                refinement_k=refinement_k,
+                enc_freq=(2e-2, 2e-1, 2, 4, 8, 16, 32, 64),
+                enc_freq_scale=1,
+                debug_refinement=debug_refinement,
+            )
         else:
             raise ValueError(
-                f"Unsupported GIRNet_arch={GIRNet_arch!r}; expected legacy or full2full_v1"
+                f"Unsupported GIRNet_arch={GIRNet_arch!r}; expected legacy, full2full_v1, or full2full_v2"
             )
         self.text_film = BertFiLM(
             out_channels=50,
@@ -152,6 +171,9 @@ class TextConditionedGIRNet(nn.Module):
                     "[Info] full2full_v1 legacy initialization disabled; "
                     "GIRNet backbone starts from its own initialization"
                 )
+
+        if init_registration_checkpoint:
+            self._init_registration_from_checkpoint(init_registration_checkpoint)
 
     def _load_completion_checkpoint(self, checkpoint_path):
         checkpoint = torch.load(checkpoint_path, map_location="cpu")
@@ -325,6 +347,66 @@ class TextConditionedGIRNet(nn.Module):
             for key in critical_mismatch[:20]:
                 print(f"  - {key}")
 
+    def _init_registration_from_checkpoint(self, checkpoint_path):
+        """Load registration-only weights from a GT-pretrained full2full_v2 checkpoint.
+
+        Only loads GIRNet backbone, GlobalMatcher, and iterative refiner parameters.
+        Does NOT load optimizer, GradScaler, epoch, SPAQNet params, or best metric.
+        """
+        if self.GIRNet_arch != "full2full_v2":
+            raise RuntimeError(
+                "--init_registration_checkpoint is only supported for "
+                f"full2full_v2, got arch={self.GIRNet_arch!r}"
+            )
+        checkpoint = torch.load(checkpoint_path, map_location="cpu")
+        checkpoint_arch = None
+        if isinstance(checkpoint, dict):
+            checkpoint_arch = checkpoint.get("GIRNet_arch")
+            if checkpoint_arch is None:
+                checkpoint_arch = checkpoint.get("config", {}).get("GIRNet_arch")
+        if checkpoint_arch != "full2full_v2":
+            raise RuntimeError(
+                "Cannot initialize full2full_v2 from a checkpoint with "
+                f"architecture={checkpoint_arch!r}; only full2full_v2 is allowed"
+            )
+
+        # Extract state dict, stripping "module." and "backbone." prefixes.
+        state = checkpoint
+        if isinstance(checkpoint, dict):
+            for key in ("model", "model_state_dict", "state_dict"):
+                if key in checkpoint and isinstance(checkpoint[key], dict):
+                    state = checkpoint[key]
+                    break
+
+        cleaned = {}
+        for key, value in state.items():
+            key = key.removeprefix("module.")
+            cleaned[key] = value
+
+        # Filter to only registration-related keys (exclude completion, BertFiLM).
+        reg_keys = {
+            k for k in self.backbone.state_dict()
+        }
+        filtered = {k: v for k, v in cleaned.items() if k in reg_keys}
+        missing = [k for k in reg_keys if k not in cleaned]
+        unexpected = [k for k in cleaned if k not in reg_keys]
+
+        self.backbone.load_state_dict(filtered, strict=False)
+        loaded_count = len(filtered)
+        print(
+            f"[Info] init_registration_checkpoint {checkpoint_path}: "
+            f"loaded={loaded_count}, missing={len(missing)}, "
+            f"unexpected={len(unexpected)}"
+        )
+        if missing:
+            print("[Info] Registration init missing keys (first 20):")
+            for k in missing[:20]:
+                print(f"  - {k}")
+        if unexpected:
+            print("[Info] Registration init unexpected keys (first 20):")
+            for k in unexpected[:20]:
+                print(f"  - {k}")
+
     def forward(
         self,
         src_xyz,
@@ -392,6 +474,10 @@ class TextConditionedGIRNet(nn.Module):
             pred_xyz = src_xyz + normalized_flow * scale
             pred_stages_xyz = [pred_xyz]
             global_match_confidence = None
+            global_assignment = None
+            source_global_indices = None
+            target_global_xyz = None
+            score_weights = None
         else:
             normalized_flow_stages = results["flow_stages"]
             pred_stages_xyz = [
@@ -400,6 +486,10 @@ class TextConditionedGIRNet(nn.Module):
             ]
             pred_xyz = pred_stages_xyz[-1]
             global_match_confidence = results["global_match_confidence"]
+            global_assignment = results.get("global_assignment")
+            source_global_indices = results.get("source_global_indices")
+            target_global_xyz = results.get("target_global_xyz")
+            score_weights = results.get("score_weights")
 
         # Always return completion outputs for metric logging.
         return {
@@ -408,4 +498,8 @@ class TextConditionedGIRNet(nn.Module):
             "completed_xyz": completed_xyz,
             "completion_outputs": completion_outputs,
             "global_match_confidence": global_match_confidence,
+            "global_assignment": global_assignment,
+            "source_global_indices": source_global_indices,
+            "target_global_xyz": target_global_xyz,
+            "score_weights": score_weights,
         }

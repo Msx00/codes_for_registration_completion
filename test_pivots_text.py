@@ -185,7 +185,7 @@ def test(
         for key in batch:
             batch[key] = batch[key].to(device, non_blocking=True)
 
-        with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=use_amp and device.type == "cuda"):
+        with torch.cuda.amp.autocast(enabled=use_amp and device.type == "cuda"):
             out = model(
                 batch["src_xyz"],
                 batch["part_xyz"],
@@ -311,7 +311,7 @@ def main():
         checkpoint.get("GIRNet_arch")
         if isinstance(checkpoint, dict)
         else None
-    ) or checkpoint_config.get("GIRNet_arch", "legacy")
+    ) or checkpoint_config.get("GIRNet_arch", "legacy") or checkpoint_config.get("pivots_arch", "legacy")
     use_text = (
         bool(checkpoint_config.get("use_text", False))
         if args.use_text is None
@@ -364,6 +364,9 @@ def main():
         ),
         refinement_k=int(checkpoint_config.get("refinement_k", 35)),
         initialize_from_legacy_GIRNet=False,
+        global_gate_temperature=float(
+            checkpoint_config.get("global_gate_temperature", 0.02)
+        ),
     ).to(device)
     load_model_checkpoint(model, checkpoint, args.checkpoint)
 

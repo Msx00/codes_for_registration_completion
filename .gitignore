@@ -1,0 +1,18 @@
+
+logs/
+__pycache__/
+bert-base-uncased
+oldcodes/
+PIVOTS/
+wandb/
+test_results/
+completion/__pycache__/
+completion/logs
+completion/Physics3D
+completion/SplAttN
+completion/test_results
+completion/wandb
+
+completion-only copy/
+completion-only copy 2/
+completion-old/

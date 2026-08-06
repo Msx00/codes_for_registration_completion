@@ -1,0 +1,8 @@
+torch
+pyyaml
+matplotlib
+vtk
+tqdm
+scipy
+open3d
+easydict

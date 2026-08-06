@@ -1,0 +1,23 @@
+{
+  "checkpoint": "/home/ma_sx/Project/Liver2/compeltion-only/logs/full_aug_20260805_013524/best.pth",
+  "architecture": "generative",
+  "split": "test",
+  "case_count": 2284,
+  "view_count": 2284,
+  "overlap": 0.25,
+  "anchor_observed_postprocess": false,
+  "rmse_definition": "symmetric_chamfer",
+  "pointwise_rmse_definition": "sqrt(mean_i(||completed[i]-gt[i]||_2^2))",
+  "symmetric_chamfer_rmse_definition": "sqrt(0.5*(mean_pred_nn_squared+mean_gt_nn_squared))",
+  "mae_definition": "symmetric_nearest_neighbor_euclidean",
+  "mean_case_mae_mm": 3.3453936125893935,
+  "mean_case_pointwise_rmse_mm": 114.43281708396067,
+  "mean_case_symmetric_chamfer_rmse_mm": 4.645298111487617,
+  "rmse_mm": 4.759073918645101,
+  "pointwise_rmse_mm": 114.85437944203835,
+  "symmetric_chamfer_rmse_mm": 4.759073918645101,
+  "mae_mm": 3.3453936125893935,
+  "observed_rmse_mm": 3.3755687277242212,
+  "missing_rmse_mm": 6.647113389243139,
+  "source_baseline_rmse_mm": 19.91959850426523
+}

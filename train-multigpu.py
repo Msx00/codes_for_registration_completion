@@ -150,6 +150,59 @@ def stage_metric_names(GIRNet_arch, num_refinement_steps):
     return names
 
 
+def _batched_gather(points, indices):
+    """Gather (B, M, C) points with (B, N) long indices -> (B, N, C)."""
+    batch_index = torch.arange(points.shape[0], device=points.device).view(-1, 1)
+    return points[batch_index, indices]
+
+
+def compute_match_loss(
+    global_assignment,
+    source_global_indices,
+    target_global_xyz,
+    gt_xyz,
+    match_sigma_mm,
+):
+    """Supervise GlobalMatcher assignment using GT nearest-neighbor labels.
+
+    Args:
+        global_assignment: (B, Ns_coarse, Nt_coarse) dual-softmax assignment.
+        source_global_indices: (B, Ns_coarse) long, coarse src -> full src indices.
+        target_global_xyz: (B, Nt_coarse, 3) coarse target coordinates (mm).
+        gt_xyz: (B, Ngt, 3) ground truth coordinates (mm).
+        match_sigma_mm: Gaussian bandwidth for match weight (mm).
+
+    Returns:
+        L_match scalar (float32).
+    """
+    if global_assignment is None or source_global_indices is None:
+        return torch.tensor(0.0, device=gt_xyz.device, dtype=torch.float32)
+
+    # Gather GT points at the coarse source positions.
+    gt_coarse = _batched_gather(gt_xyz, source_global_indices)  # (B, Ns, 3)
+
+    with torch.no_grad():
+        distance2 = torch.cdist(
+            gt_coarse.float(), target_global_xyz.float(), p=2
+        ).square()  # (B, Ns, Nt)
+        pseudo_target_index = distance2.argmin(dim=-1)  # (B, Ns)
+        min_distance2 = distance2.gather(
+            dim=-1, index=pseudo_target_index.unsqueeze(-1)
+        ).squeeze(-1)  # (B, Ns)
+        match_weight = torch.exp(
+            -min_distance2 / (2.0 * match_sigma_mm ** 2)
+        )  # (B, Ns)
+
+    matched_probability = global_assignment.float().gather(
+        dim=-1, index=pseudo_target_index.unsqueeze(-1)
+    ).squeeze(-1)  # (B, Ns)
+
+    L_match = -(
+        match_weight * torch.log(matched_probability.clamp_min(1e-8))
+    ).sum() / match_weight.sum().clamp_min(1e-8)
+    return L_match
+
+
 def auxiliary_stage_huber_loss(pred_stages, gt, weights, beta_mm):
     """Huber supervision for every non-final full2full stage."""
     auxiliary_predictions = pred_stages[:-1]
@@ -184,6 +237,20 @@ def train_one_epoch(
         # network to eval mode for deterministic, independent target creation.
         model.module.completion.eval()
 
+    # Determine AMP settings (PyTorch 1.9 compatible).
+    if args.amp_dtype == "fp32":
+        use_amp = False
+        amp_dtype = None
+    elif args.amp_dtype == "bf16":
+        # BF16 autocast not available in PyTorch <1.10; fall back to FP32.
+        if rank == 0:
+            print("[Warning] bf16 autocast requires PyTorch >=1.10; falling back to fp32")
+        use_amp = False
+        amp_dtype = None
+    else:  # fp16
+        use_amp = True
+        amp_dtype = torch.float16
+
     stage_names = stage_metric_names(
         args.GIRNet_arch, args.num_refinement_steps
     )
@@ -193,6 +260,7 @@ def train_one_epoch(
         "aux_stage_loss",
         "reg_mse",
         "reg_cd",
+        "match_loss",
         "physics",
         "completion",
         "completion_fine",
@@ -201,8 +269,8 @@ def train_one_epoch(
     ]
     # loss sums, gradient sums, source squared error, confidence sum,
     # sample/point/confidence/batch counts, non-finite gradient batch count,
-    # then one squared-error sum per stage.
-    base_meter_count = len(loss_names) + 9
+    # then one squared-error sum per stage, plus score weight sums (3).
+    base_meter_count = len(loss_names) + 12
     meters = torch.zeros(
         base_meter_count + len(stage_names),
         device=device,
@@ -210,15 +278,14 @@ def train_one_epoch(
     )
 
     iterator = tqdm(loader, desc="Train", leave=False) if rank == 0 else loader
+    consecutive_nonfinite = 0
 
     for batch_idx, batch in enumerate(iterator):
         try:
             for k in batch:
                 batch[k] = batch[k].to(device, non_blocking=True)
 
-            with torch.autocast(device_type='cuda',
-                                dtype=torch.float16,
-                                enabled=True):
+            with torch.cuda.amp.autocast(enabled=use_amp):
 
                 # --- forward ---
                 if args.registration_target_mode == "gt":
@@ -255,16 +322,33 @@ def train_one_epoch(
                     args.aux_stage_weights,
                     args.huber_beta_mm,
                 )
-                L_reg_mse = F.mse_loss(pred, batch["gt_xyz"])
-
-                # CD target depends on mode
-                if args.registration_target_mode == "gt":
-                    cd_target = batch["gt_xyz"]
-                else:
-                    cd_target = completed.detach()
-                L_reg_cd = registration_chamfer(
-                    batch["src_xyz"], pred, cd_target,
+                L_reg_mse = F.mse_loss(
+                    pred.float(), batch["gt_xyz"].float(),
                 )
+
+                # CD for optimization ALWAYS uses GT as label.
+                L_reg_cd = registration_chamfer(
+                    batch["src_xyz"], pred, batch["gt_xyz"],
+                )
+
+                # Optional: CD(pred, completed) for logging only (detached).
+                L_reg_cd_completed = torch.tensor(0.0, device=device)
+                if args.w_reg_cd_completed > 0:
+                    L_reg_cd_completed = registration_chamfer(
+                        batch["src_xyz"], pred, completed.detach(),
+                    )
+
+                # --- match loss (full2full_v2 only) ---
+                if args.w_match > 0 and args.GIRNet_arch == "full2full_v2":
+                    L_match = compute_match_loss(
+                        out.get("global_assignment"),
+                        out.get("source_global_indices"),
+                        out.get("target_global_xyz"),
+                        batch["gt_xyz"],
+                        args.match_sigma_mm,
+                    )
+                else:
+                    L_match = torch.tensor(0.0, device=device)
 
                 # --- physics (off by default) ---
                 if args.w_phys > 0:
@@ -304,8 +388,10 @@ def train_one_epoch(
                 # --- total ---
                 loss = (
                     args.w_reg_huber * L_reg_huber
+                    + args.w_reg_mse * L_reg_mse
+                    + args.w_reg_cd_gt * L_reg_cd
                     + args.w_aux_stages * L_aux_stages
-                    + args.w_reg_cd * L_reg_cd
+                    + args.w_match * L_match
                     + args.w_phys * L_phys
                     + args.w_completion * L_completion
                 )
@@ -316,10 +402,13 @@ def train_one_epoch(
                 continue
 
             optimizer.zero_grad(set_to_none=True)
-            scaler.scale(loss).backward()
-            scaler.unscale_(optimizer)
+            if scaler is not None:
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
+            else:
+                loss.backward()
 
-            # --- gradient norms (after unscale, before clip) ---
+            # --- gradient norms ---
             reg_params = [
                 p for p in model.parameters()
                 if id(p) not in completion_param_ids and p.requires_grad
@@ -334,11 +423,11 @@ def train_one_epoch(
                 device=device,
                 dtype=torch.int32,
             )
-            # All ranks must make the same optimizer-step decision.
             dist.all_reduce(nonfinite_flag, op=dist.ReduceOp.MAX)
             nonfinite_registration_gradients = bool(nonfinite_flag.item())
 
             if nonfinite_registration_gradients:
+                consecutive_nonfinite += 1
                 reg_grad_norm = 0.0
                 comp_grad_norm = (
                     _compute_grad_norm(comp_params)
@@ -346,13 +435,20 @@ def train_one_epoch(
                     else 0.0
                 )
                 optimizer.zero_grad(set_to_none=True)
-                scaler.update()
+                if scaler is not None:
+                    scaler.update()
                 if rank == 0:
                     print(
                         "[Warning] Non-finite registration gradients; "
-                        "skipped optimizer step"
+                        f"skipped optimizer step (consecutive={consecutive_nonfinite})"
+                    )
+                if consecutive_nonfinite >= 3:
+                    raise RuntimeError(
+                        "Non-finite registration gradients in 3 consecutive "
+                        "batches. Terminating training to avoid silent divergence."
                     )
             else:
+                consecutive_nonfinite = 0
                 reg_grad_norm = _compute_grad_norm(reg_params)
                 comp_grad_norm = (
                     _compute_grad_norm(comp_params)
@@ -360,8 +456,11 @@ def train_one_epoch(
                     else 0.0
                 )
                 nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-                scaler.step(optimizer)
-                scaler.update()
+                if scaler is not None:
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    optimizer.step()
 
             with torch.no_grad():
                 batch_size, point_count_per_sample, _ = pred.shape
@@ -372,6 +471,7 @@ def train_one_epoch(
                     L_aux_stages,
                     L_reg_mse,
                     L_reg_cd,
+                    L_match,
                     L_phys,
                     L_completion,
                     completion_losses["loss_fine"],
@@ -399,6 +499,17 @@ def train_one_epoch(
                 meters[offset + 6] += confidence_count
                 meters[offset + 7] += 1
                 meters[offset + 8] += int(nonfinite_registration_gradients)
+
+                # score_weights from GlobalMatcherV2
+                score_weights = out.get("score_weights")
+                if score_weights is not None:
+                    meters[offset + 9] += score_weights[0].double()
+                    meters[offset + 10] += score_weights[1].double()
+                    meters[offset + 11] += score_weights[2].double()
+                else:
+                    meters[offset + 9] += 0.0
+                    meters[offset + 10] += 0.0
+                    meters[offset + 11] += 0.0
 
                 stage_offset = base_meter_count
                 for stage_index, stage_pred in enumerate(pred_stages):
@@ -432,6 +543,9 @@ def train_one_epoch(
         meters[offset + 3] / confidence_count
     ).item()
     metrics["nonfinite_gradient_batches"] = meters[offset + 8].item()
+    metrics["score_weight_spatial"] = (meters[offset + 9] / batch_count).item()
+    metrics["score_weight_feature"] = (meters[offset + 10] / batch_count).item()
+    metrics["score_weight_geometry"] = (meters[offset + 11] / batch_count).item()
     for stage_index, stage_name in enumerate(stage_names):
         metrics[f"{stage_name}_point_rmse"] = torch.sqrt(
             meters[base_meter_count + stage_index] / point_count
@@ -664,6 +778,8 @@ def main_worker(rank, world_size, args_dict):
             refinement_k=args.refinement_k,
             initialize_from_legacy_GIRNet=args.initialize_from_legacy_GIRNet,
             debug_refinement=args.debug_refinement,
+            global_gate_temperature=args.global_gate_temperature,
+            init_registration_checkpoint=args.init_registration_checkpoint,
         ).to(device)
         if model.completion is None:
             raise RuntimeError("completion_checkpoint is required for training")
@@ -684,7 +800,13 @@ def main_worker(rank, world_size, args_dict):
             model.completion_config,
             device,
         )
-        
+
+        # GradScaler only for fp16.
+        if args.amp_dtype == "fp16":
+            scaler = torch.cuda.amp.GradScaler()
+        else:
+            scaler = None
+
         # 同步barrier确保所有进程都创建了模型
         dist.barrier()
         
@@ -736,7 +858,7 @@ def main_worker(rank, world_size, args_dict):
             print(f"[Info] train_stage: {args.train_stage}")
             print(f"[Info] registration_target_mode: {args.registration_target_mode}")
             print(f"[Info] GIRNet_arch: {args.GIRNet_arch}")
-            if args.GIRNet_arch == "full2full_v1":
+            if args.GIRNet_arch in ("full2full_v1", "full2full_v2"):
                 print(
                     "[Info] global match points: "
                     f"{model.module.backbone.global_match_points}"
@@ -752,6 +874,11 @@ def main_worker(rank, world_size, args_dict):
                     "[Info] max_coarse_flow_normalized: "
                     f"{args.max_coarse_flow_normalized}"
                 )
+                if args.GIRNet_arch == "full2full_v2":
+                    print(
+                        "[Info] global_gate_temperature: "
+                        f"{args.global_gate_temperature}"
+                    )
                 print(
                     f"[Info] num_refinement_steps: {args.num_refinement_steps}"
                 )
@@ -760,11 +887,16 @@ def main_worker(rank, world_size, args_dict):
             print(f"[Info] registration lr: {args.lr}")
             print(f"[Info] completion lr: {args.completion_lr}")
             print(f"[Info] w_reg_huber: {args.w_reg_huber}")
+            print(f"[Info] w_reg_mse: {args.w_reg_mse}")
+            print(f"[Info] w_reg_cd_gt: {args.w_reg_cd_gt}")
+            print(f"[Info] w_reg_cd_completed: {args.w_reg_cd_completed}")
             print(f"[Info] w_aux_stages: {args.w_aux_stages}")
             print(f"[Info] aux_stage_weights: {args.aux_stage_weights}")
-            print(f"[Info] w_reg_cd: {args.w_reg_cd}")
+            print(f"[Info] w_match: {args.w_match}")
+            print(f"[Info] match_sigma_mm: {args.match_sigma_mm}")
             print(f"[Info] w_phys: {args.w_phys}")
             print(f"[Info] w_completion: {args.w_completion}")
+            print(f"[Info] amp_dtype: {args.amp_dtype}")
             print(f"[Info] use_text: {args.use_text}")
 
         completion_parameter_ids = {
@@ -800,8 +932,6 @@ def main_worker(rank, world_size, args_dict):
                 ],
                 weight_decay=args.weight_decay,
             )
-        scaler = torch.cuda.amp.GradScaler()
-
         start_epoch = 0
         best_eval_point_rmse = float('inf')
 
@@ -852,6 +982,12 @@ def main_worker(rank, world_size, args_dict):
             train_sampler.set_epoch(epoch)
             T_dataset.set_epoch(epoch)
 
+            # Per-epoch: ensure SPAQNet stays frozen in registration mode.
+            if args.train_stage == "registration":
+                model.module.completion.eval()
+                for parameter in model.module.completion.parameters():
+                    parameter.requires_grad_(False)
+
             if rank == 0:
                 print(f"\n===== Epoch {epoch+1}/{args.epochs} =====")
 
@@ -880,10 +1016,14 @@ def main_worker(rank, world_size, args_dict):
                     f"aux={train_metrics['aux_stage_loss']:.6f} "
                     f"mse={train_metrics['reg_mse']:.6f} "
                     f"cd={train_metrics['reg_cd']:.6f} "
+                    f"match={train_metrics.get('match_loss', 0):.6f} "
                     f"{train_stage_text} "
                     f"final_point_rmse={train_metrics['final_point_rmse']:.4f}mm "
                     f"source_rmse={train_metrics['source_point_rmse']:.4f}mm "
                     f"global_conf={train_metrics['global_match_confidence']:.6f} "
+                    f"sw_spat={train_metrics.get('score_weight_spatial', 0):.3f} "
+                    f"sw_feat={train_metrics.get('score_weight_feature', 0):.3f} "
+                    f"sw_geom={train_metrics.get('score_weight_geometry', 0):.3f} "
                     f"phys={train_metrics['physics']:.6f} "
                     f"comp={train_metrics['completion']:.6f} "
                     f"reg_grad={train_metrics['registration_grad_norm']:.4f} "
@@ -909,36 +1049,43 @@ def main_worker(rank, world_size, args_dict):
                     f"aux={eval_metrics['eval_aux_stage_loss']:.6f} "
                     f"mse={eval_metrics['eval_reg_mse']:.6f} "
                     f"cd={eval_metrics['eval_reg_cd']:.6f} "
+                    f"match={eval_metrics.get('eval_match_loss', 0):.6f} "
                     f"{eval_stage_text} "
                     f"final_point_rmse={eval_metrics['eval_final_point_rmse']:.4f}mm "
                     f"source_rmse={eval_metrics['eval_source_point_rmse']:.4f}mm "
+                    f"mae={eval_metrics.get('eval_point_mae', 0):.4f}mm "
                     f"global_conf={eval_metrics['eval_global_match_confidence']:.6f} "
-                    f"comp_cd={eval_metrics['eval_completion_cd']:.6f}"
+                    f"pred_gt_cd={eval_metrics.get('eval_pred_gt_cd', 0):.6f} "
+                    f"pred_comp_cd={eval_metrics.get('eval_pred_completed_cd', 0):.6f} "
+                    f"comp_gt_cd={eval_metrics.get('eval_completion_gt_cd', 0):.6f} "
+                    f"sw_spat={eval_metrics.get('score_weight_spatial', 0):.3f} "
+                    f"sw_feat={eval_metrics.get('score_weight_feature', 0):.3f} "
+                    f"sw_geom={eval_metrics.get('score_weight_geometry', 0):.3f}"
                 )
 
                 # 保存checkpoint (只在rank 0保存)
-                save_ckpt({
+                last_ckpt = {
                     'epoch': epoch,
                     'model': model.module.state_dict(),
                     'optimizer': optimizer.state_dict(),
-                    'scaler': scaler.state_dict(),
                     'best_eval_point_rmse': best_eval_point_rmse,
                     'GIRNet_arch': args.GIRNet_arch,
                     'config': args_dict,
-                }, Path(args.save_dir) / 'last.pth')
+                }
+                if scaler is not None:
+                    last_ckpt['scaler'] = scaler.state_dict()
+                save_ckpt(last_ckpt, Path(args.save_dir) / 'last.pth')
 
                 if eval_metrics['eval_reg_point_rmse'] < best_eval_point_rmse:
                     best_eval_point_rmse = eval_metrics['eval_reg_point_rmse']
-                    save_ckpt(
-                        {
-                            'epoch': epoch,
-                            'model': model.module.state_dict(),
-                            'best_eval_point_rmse': best_eval_point_rmse,
-                            'GIRNet_arch': args.GIRNet_arch,
-                            'config': args_dict,
-                        },
-                        Path(args.save_dir) / 'best.pth',
-                    )
+                    best_ckpt = {
+                        'epoch': epoch,
+                        'model': model.module.state_dict(),
+                        'best_eval_point_rmse': best_eval_point_rmse,
+                        'GIRNet_arch': args.GIRNet_arch,
+                        'config': args_dict,
+                    }
+                    save_ckpt(best_ckpt, Path(args.save_dir) / 'best.pth')
                     print(f"[Info] New best point_rmse: {best_eval_point_rmse:.6f}mm (saved best.pth)")
 
                 if args.use_wandb:
@@ -998,8 +1145,8 @@ def main():
     ap.add_argument('--train_bert', action='store_true')
     ap.add_argument('--GIRNet_checkpoint', type=str, default='')
     ap.add_argument('--strict_GIRNet_checkpoint', default=False, action=argparse.BooleanOptionalAction)
-    ap.add_argument('--GIRNet_arch', type=str, default='full2full_v1',
-                    choices=['legacy', 'full2full_v1'])
+    ap.add_argument('--GIRNet_arch', type=str, default='full2full_v2',
+                    choices=['legacy', 'full2full_v1', 'full2full_v2'])
     ap.add_argument('--global_match_level', type=int, default=2)
     ap.add_argument('--global_match_temperature', type=float, default=0.1)
     ap.add_argument('--global_match_dim', type=int, default=64)
@@ -1030,15 +1177,23 @@ def main():
     ap.add_argument('--aux_stage_weights', type=parse_float_list,
                     default=parse_float_list('0.1,0.2,0.5'))
     ap.add_argument('--w_reg_cd', type=float, default=0.05)
-    ap.add_argument('--w_reg_mse', '--w_sup', dest='w_reg_mse', type=float, default=0.0)
+    ap.add_argument('--w_reg_mse', '--w_sup', dest='w_reg_mse', type=float, default=0.02)
+    ap.add_argument('--w_reg_cd_gt', type=float, default=0.05)
+    ap.add_argument('--w_reg_cd_completed', type=float, default=0.0)
+    ap.add_argument('--w_match', type=float, default=0.1)
+    ap.add_argument('--match_sigma_mm', type=float, default=5.0)
+    ap.add_argument('--global_gate_temperature', type=float, default=0.02)
+    ap.add_argument('--amp_dtype', type=str, default='bf16',
+                    choices=['fp32', 'fp16', 'bf16'])
     ap.add_argument('--w_completion', type=float, default=0.0)
     ap.add_argument('--w_phys', type=float, default=0.0)
     ap.add_argument('--phys_k', type=int, default=24)
     ap.add_argument('--phys_reg', type=float, default=1e-4)
-    
+
     # 训练细节
     ap.add_argument('--eval_split_ratio', type=float, default=0.1)
     ap.add_argument('--resume', type=str, default='')
+    ap.add_argument('--init_registration_checkpoint', type=str, default='')
     
     # wandb 相关
     ap.add_argument('--use_wandb', default=False, action=argparse.BooleanOptionalAction)
@@ -1062,7 +1217,7 @@ def main():
     if args.refinement_k < 1:
         ap.error('--refinement_k must be at least 1')
     if (
-        args.GIRNet_arch == 'full2full_v1'
+        args.GIRNet_arch in ('full2full_v1', 'full2full_v2')
         and len(args.aux_stage_weights) != args.num_refinement_steps
     ):
         ap.error(

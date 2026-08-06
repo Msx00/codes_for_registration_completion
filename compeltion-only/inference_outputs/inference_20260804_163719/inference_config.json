@@ -1,0 +1,21 @@
+{
+  "checkpoint": "/home/ma_sx/Project/Liver2/compeltion-only/logs/full_aug_20260804_151643/last.pth",
+  "dataset_root": "/home/ma_sx/Project/Dataset/MedShapeNet-Liver",
+  "split": "validation",
+  "max_cases": 10,
+  "num_points": 2048,
+  "overlap": 0.25,
+  "crops_per_case": 1,
+  "crop_types": "ball,plane,slab,multi_ball",
+  "batch_cases": 1,
+  "num_workers": 2,
+  "seed": 42,
+  "device": "auto",
+  "amp": "fp16",
+  "output_dir": "/home/ma_sx/Project/Liver2/compeltion-only/inference_outputs/inference_20260804_163719",
+  "save_points": true,
+  "anchor_observed": false,
+  "architecture": "generative",
+  "checkpoint_epoch": 99,
+  "checkpoint_best_rmse_mm": 5.809713405296733
+}
