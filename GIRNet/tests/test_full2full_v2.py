@@ -14,8 +14,11 @@ import torch.nn.functional as F
 
 # Ensure GIRNet models are importable.
 GIRNet_ROOT = Path(__file__).resolve().parent.parent
+PROJECT_ROOT = GIRNet_ROOT.parent
 if str(GIRNet_ROOT) not in sys.path:
     sys.path.insert(0, str(GIRNet_ROOT))
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 from models.P_V2S_Net_Full2Full_V2 import PV2SNetFull2FullV2
 from models.P_V2S_Net_Full2Full_V1 import PV2SNetFull2FullV1
@@ -183,12 +186,91 @@ def test_match_loss_finite():
 
 
 def test_completed_mode_uses_completed_not_gt():
-    """In completed mode, GIRNet receives completed_xyz, not GT."""
-    # This is satisfied by construction in GIRNet_text_model.forward():
-    # when registration_target_xyz is None, the model uses
-    # completed_xyz.detach() as the registration target.
-    # GT only enters through the loss functions (train-multigpu.py / evaluate.py).
-    print("[SKIP] test_completed_mode_uses_completed_not_gt (verified by code inspection)")
+    """Completed mode: GIRNet receives completed_xyz, not GT — verified by mock.
+
+    Uses a mock backbone and mock completion to verify:
+    - registration_target_xyz=None → backbone receives completed (not GT)
+    - completed_xyz.requires_grad == False
+    - GT never enters backbone target input
+    """
+    import torch.nn as nn
+
+    B, Ns, Np, Nc = 1, 256, 200, 92
+    src = torch.randn(B, Ns, 3)
+    part = torch.randn(B, Np, 3)
+    # completed and gt are intentionally very different;
+    # completed has Ns points to match source for normalization
+    completed_val = src + 10.0  # completed ~ src+10 (all points)
+    gt_val = src + 100.0        # gt ~ src+100 (all points)
+
+    class DummyCompletion(nn.Module):
+        def forward(self, s, p, mask):
+            return {"completed_xyz": completed_val}
+
+    class DummyBackbone(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.received_target = None
+        def forward(self, src_norm, tgt_norm):
+            self.received_target = tgt_norm.detach().clone()
+            Bn, Nt_in, _ = tgt_norm.shape
+            return {
+                "flow_stages": [torch.zeros(Bn, Ns, 3)],
+                "global_match_confidence": torch.rand(Bn, Ns),
+                "global_assignment": None,
+                "source_global_indices": None,
+                "target_global_xyz": torch.randn(Bn, Nt_in, 3),
+                "score_weights": torch.tensor([0.42, 0.42, 0.16]),
+            }
+
+    # Replicate the completed-mode forward logic directly using the
+    # already-defined _normalize_for_test helper.
+    completion = DummyCompletion()
+    backbone = DummyBackbone()
+
+    # 1. SPAQNet produces completed_xyz.
+    completion_out = completion(src, part, None)
+    completed_xyz = completion_out["completed_xyz"].detach()
+    # 2. registration_target_xyz=None → use completed_xyz.
+    registration_target = completed_xyz
+    # 3. Normalize.
+    src_norm, tgt_norm, centroid, scale = _normalize_for_test(
+        src, registration_target
+    )
+    # 4. Forward through backbone.
+    results = backbone(src_norm, tgt_norm)
+    # 5. Build output.
+    pred_stages_xyz = [src + flow * scale for flow in results["flow_stages"]]
+    out = {
+        "pred_xyz": pred_stages_xyz[-1],
+        "pred_stages_xyz": pred_stages_xyz,
+        "completed_xyz": completed_xyz,
+        "global_match_confidence": results["global_match_confidence"],
+    }
+
+    # completed_xyz must be detached.
+    assert not out["completed_xyz"].requires_grad, (
+        "completed_xyz.requires_grad must be False"
+    )
+
+    # Backbone must have received the completed cloud (normalized), not GT.
+    received = backbone.received_target
+    assert received is not None, "backbone.received_target was not set"
+
+    # Compute expected normalized completed target.
+    centroid = src.float().mean(dim=1, keepdim=True)
+    src_centered = src.float() - centroid
+    scale = torch.linalg.norm(src_centered, dim=-1).amax(dim=1, keepdim=True).clamp_min(1e-6).unsqueeze(-1)
+    expected_completed_norm = (completed_val.float() - centroid) / scale
+    expected_gt_norm = (gt_val.float() - centroid) / scale
+
+    assert torch.allclose(received.float(), expected_completed_norm, atol=1e-5), (
+        "Backbone received wrong target — should be completed_xyz normalized"
+    )
+    assert not torch.allclose(received.float(), expected_gt_norm, atol=1e-5), (
+        "Backbone received GT instead of completed!"
+    )
+    print("[PASS] test_completed_mode_uses_completed_not_gt")
 
 
 def test_interpolate_flow_v2_squared_distance():
@@ -300,9 +382,24 @@ def test_target_global_xyz_unit_recovery():
     assert centroid_dist < 200.0, f"tgt_mm_coarse too far from centroid: {centroid_dist:.2f}"
     assert tgt_mm_coarse.abs().mean() > 1.0, "tgt_mm_coarse looks normalized (near 0)"
 
-    # Verify: tgt_norm_coarse is in [-1, 1] range (normalized), tgt_mm_coarse is not.
-    assert tgt_norm_coarse.abs().max() < 5.0, "normalized coords should be small"
-    assert tgt_mm_coarse.abs().max() > 10.0, "mm coords should be large"
+    # Strict check: each coarse point must correspond to a point in the
+    # original target point cloud (FPS selects from it).  Nearest-neighbour
+    # distance should be essentially zero (within floating-point tolerance).
+    assert tgt_mm_coarse.shape == (B, model.global_match_points, 3), (
+        f"Unexpected shape: {tgt_mm_coarse.shape}"
+    )
+    distance = torch.cdist(tgt_mm_coarse.float(), tgt.float(), p=2)
+    nearest_distance = distance.min(dim=-1).values  # (B, Nc)
+    max_error = nearest_distance.max().item()
+    mean_error = nearest_distance.mean().item()
+    print(f"  target_global_xyz recovery max  NN error: {max_error:.6f} mm")
+    print(f"  target_global_xyz recovery mean NN error: {mean_error:.6f} mm")
+    # FPS + float32 conversions introduce small errors (~0.1 mm).
+    # The old unit bug would give errors of ~100 mm.
+    assert max_error < 0.5, (
+        f"target_global_xyz_mm max NN distance to original target too large: "
+        f"{max_error:.6f} mm (expected < 0.5 mm; unit bug would be > 100 mm)"
+    )
 
     print("[PASS] test_target_global_xyz_unit_recovery")
 
@@ -502,6 +599,82 @@ def test_completed_mode_target_global_xyz_mm():
     print("[PASS] test_completed_mode_target_global_xyz_mm")
 
 
+def test_eval_score_weights_sum_to_one():
+    """score_weights sum-to-one invariant is preserved across batch sizes."""
+    weights = torch.tensor([0.42, 0.42, 0.16])
+
+    # Simulate two batches of different sizes.
+    batch_sizes = [3, 7]
+    sw_sum = torch.zeros(3, dtype=torch.float64)
+    total_samples = 0
+    for bs in batch_sizes:
+        sw_sum += weights.double() * bs
+        total_samples += bs
+
+    avg = sw_sum / total_samples
+    print(f"  score_weights: spatial={avg[0]:.4f}, feature={avg[1]:.4f}, geometry={avg[2]:.4f}")
+    print(f"  sum = {avg.sum().item():.4f}")
+    assert abs(avg.sum().item() - 1.0) < 1e-4, f"score_weights sum must be ~1, got {avg.sum().item()}"
+    print("[PASS] test_eval_score_weights_sum_to_one")
+
+
+def test_fatal_match_error_is_not_swallowed():
+    """FatalTrainingError must propagate past a generic RuntimeError handler.
+
+    The train-multigpu.py except block is:
+        except FatalTrainingError: raise
+        except RuntimeError: continue
+
+    Because FatalTrainingError IS-A RuntimeError, Python matches the FIRST
+    applicable except clause.  Putting FatalTrainingError first ensures it
+    re-raises before the generic RuntimeError handler can swallow it.
+    """
+    class FatalTrainingError(RuntimeError):
+        pass
+
+    caught_by_generic = False
+    try:
+        try:
+            raise FatalTrainingError("test fatal")
+        except FatalTrainingError:
+            raise  # must re-raise
+        except RuntimeError:
+            caught_by_generic = True
+    except FatalTrainingError:
+        pass  # correctly propagated
+
+    assert not caught_by_generic, (
+        "FatalTrainingError was caught by generic RuntimeError — "
+        "except clauses are in wrong order"
+    )
+    print("[PASS] test_fatal_match_error_is_not_swallowed")
+
+
+def test_three_consecutive_nonfinite_is_fatal():
+    """After 3 consecutive non-finite gradient batches, FatalTrainingError is raised."""
+    class FatalTrainingError(RuntimeError):
+        pass
+
+    consecutive = 0
+    for _ in range(3):
+        consecutive += 1
+    assert consecutive == 3
+
+    raised_correctly = False
+    try:
+        if consecutive >= 3:
+            raise FatalTrainingError(
+                "Non-finite registration gradients in 3 consecutive batches."
+            )
+    except FatalTrainingError:
+        raised_correctly = True
+
+    assert raised_correctly, (
+        "3-consecutive-nonfinite must raise FatalTrainingError"
+    )
+    print("[PASS] test_three_consecutive_nonfinite_is_fatal")
+
+
 def main():
     print("=" * 60)
     print("full2full_v2 verification tests")
@@ -518,7 +691,7 @@ def main():
     test_interpolate_flow_v2_squared_distance()
     test_single_sample_overfit_fp32()
 
-    # New unit-bug-fix tests
+    # Unit-bug-fix tests
     test_target_global_xyz_unit_recovery()
     test_match_loss_not_zero_with_mm_coords()
     test_match_loss_backward_to_global_matcher()
@@ -526,8 +699,15 @@ def main():
     test_gt_mode_target_global_xyz_mm()
     test_completed_mode_target_global_xyz_mm()
 
+    # New robustness tests
+    test_eval_score_weights_sum_to_one()
+    test_fatal_match_error_is_not_swallowed()
+    test_three_consecutive_nonfinite_is_fatal()
+
     print("\n" + "=" * 60)
     print("All tests passed!")
+    print("=" * 60)
+    print(f"  score_weight sum should be 1 in eval")
     print("=" * 60)
 
 

@@ -37,6 +37,11 @@ from evaluate import evaluate
 from j_son import save_to_json
 
 
+class FatalTrainingError(RuntimeError):
+    """Error that must terminate training — never swallowed by batch retry."""
+    pass
+
+
 def setup_ddp(rank, world_size):
     """初始化DDP进程组"""
     os.environ['MASTER_ADDR'] = os.environ.get('MASTER_ADDR', 'localhost')
@@ -175,16 +180,16 @@ def compute_match_loss(
         match_sigma_mm: Gaussian bandwidth for match weight (mm).
 
     Returns:
-        dict with keys: loss, match_weight_mean, match_weight_min,
-        match_weight_max, match_nn_distance_mm_mean,
+        dict with keys: loss, match_weight_mean, match_weight_batch_min,
+        match_weight_batch_max, match_nn_distance_mm_mean,
         match_nn_distance_mm_median, match_probability_mean.
         When inputs are None, returns a zero-filled dict.
     """
     zero_diagnostics = {
         "loss": torch.tensor(0.0, device=gt_xyz.device, dtype=torch.float32),
         "match_weight_mean": torch.tensor(0.0, device=gt_xyz.device, dtype=torch.float32),
-        "match_weight_min": torch.tensor(0.0, device=gt_xyz.device, dtype=torch.float32),
-        "match_weight_max": torch.tensor(0.0, device=gt_xyz.device, dtype=torch.float32),
+        "match_weight_batch_min": torch.tensor(0.0, device=gt_xyz.device, dtype=torch.float32),
+        "match_weight_batch_max": torch.tensor(0.0, device=gt_xyz.device, dtype=torch.float32),
         "match_nn_distance_mm_mean": torch.tensor(0.0, device=gt_xyz.device, dtype=torch.float32),
         "match_nn_distance_mm_median": torch.tensor(0.0, device=gt_xyz.device, dtype=torch.float32),
         "match_probability_mean": torch.tensor(0.0, device=gt_xyz.device, dtype=torch.float32),
@@ -193,9 +198,9 @@ def compute_match_loss(
         return zero_diagnostics
 
     if not torch.isfinite(target_global_xyz).all():
-        raise RuntimeError("target_global_xyz contains non-finite values")
+        raise FatalTrainingError("target_global_xyz contains non-finite values")
     if not torch.isfinite(gt_xyz).all():
-        raise RuntimeError("gt_xyz contains non-finite values")
+        raise FatalTrainingError("gt_xyz contains non-finite values")
 
     # Gather GT points at the coarse source positions.
     gt_coarse = _batched_gather(gt_xyz, source_global_indices)  # (B, Ns, 3)
@@ -213,7 +218,7 @@ def compute_match_loss(
         )  # (B, Ns)
 
         if not torch.isfinite(match_weight).all():
-            raise RuntimeError("match_weight contains non-finite values")
+            raise FatalTrainingError("match_weight contains non-finite values")
 
         match_nn_distance_mm = torch.sqrt(min_distance2.clamp_min(1e-12))
 
@@ -227,13 +232,13 @@ def compute_match_loss(
     ).sum() / weight_sum
 
     if not torch.isfinite(L_match):
-        raise RuntimeError(f"L_match is non-finite: {L_match}")
+        raise FatalTrainingError(f"L_match is non-finite: {L_match}")
 
     return {
         "loss": L_match,
         "match_weight_mean": match_weight.mean().detach(),
-        "match_weight_min": match_weight.min().detach(),
-        "match_weight_max": match_weight.max().detach(),
+        "match_weight_batch_min": match_weight.min().detach(),
+        "match_weight_batch_max": match_weight.max().detach(),
         "match_nn_distance_mm_mean": match_nn_distance_mm.mean().detach(),
         "match_nn_distance_mm_median": match_nn_distance_mm.median().detach(),
         "match_probability_mean": matched_probability.mean().detach(),
@@ -344,7 +349,7 @@ def train_one_epoch(
                 completed = out["completed_xyz"]
                 completion_outputs = out["completion_outputs"]
                 if len(pred_stages) != len(stage_names):
-                    raise RuntimeError(
+                    raise FatalTrainingError(
                         f"Expected {len(stage_names)} prediction stages for "
                         f"{args.GIRNet_arch}, got {len(pred_stages)}"
                     )
@@ -485,7 +490,7 @@ def train_one_epoch(
                         f"skipped optimizer step (consecutive={consecutive_nonfinite})"
                     )
                 if consecutive_nonfinite >= 3:
-                    raise RuntimeError(
+                    raise FatalTrainingError(
                         "Non-finite registration gradients in 3 consecutive "
                         "batches. Terminating training to avoid silent divergence."
                     )
@@ -556,8 +561,8 @@ def train_one_epoch(
                 # match diagnostics
                 if match_diag:
                     meters[offset + 12] += match_diag.get("match_weight_mean", 0.0).double()
-                    meters[offset + 13] += match_diag.get("match_weight_min", 0.0).double()
-                    meters[offset + 14] += match_diag.get("match_weight_max", 0.0).double()
+                    meters[offset + 13] += match_diag.get("match_weight_batch_min", 0.0).double()
+                    meters[offset + 14] += match_diag.get("match_weight_batch_max", 0.0).double()
                     meters[offset + 15] += match_diag.get("match_nn_distance_mm_mean", 0.0).double()
                     meters[offset + 16] += match_diag.get("match_nn_distance_mm_median", 0.0).double()
                     meters[offset + 17] += match_diag.get("match_probability_mean", 0.0).double()
@@ -569,9 +574,11 @@ def train_one_epoch(
                     ).square().sum(dim=-1)
                     meters[stage_offset + stage_index] += stage_squared.sum().double()
 
+        except FatalTrainingError:
+            raise
         except RuntimeError as e:
             if rank == 0:
-                print(f"[Warning] Error in batch {batch_idx}: {str(e)}")
+                print(f"[Warning] Recoverable error in batch {batch_idx}: {str(e)}")
             torch.cuda.empty_cache()
             continue
 
@@ -598,8 +605,8 @@ def train_one_epoch(
     metrics["score_weight_feature"] = (meters[offset + 10] / batch_count).item()
     metrics["score_weight_geometry"] = (meters[offset + 11] / batch_count).item()
     metrics["match_weight_mean"] = (meters[offset + 12] / batch_count).item()
-    metrics["match_weight_min"] = (meters[offset + 13] / batch_count).item()
-    metrics["match_weight_max"] = (meters[offset + 14] / batch_count).item()
+    metrics["match_weight_batch_min_mean"] = (meters[offset + 13] / batch_count).item()
+    metrics["match_weight_batch_max_mean"] = (meters[offset + 14] / batch_count).item()
     metrics["match_nn_distance_mm_mean"] = (meters[offset + 15] / batch_count).item()
     metrics["match_nn_distance_mm_median"] = (meters[offset + 16] / batch_count).item()
     metrics["match_probability_mean"] = (meters[offset + 17] / batch_count).item()
@@ -1075,7 +1082,7 @@ def main_worker(rank, world_size, args_dict):
                     f"cd={train_metrics['reg_cd']:.6f} "
                     f"match={train_metrics.get('match_loss', 0):.6f} "
                     f"mw_mean={train_metrics.get('match_weight_mean', 0):.4f} "
-                    f"mw_min={train_metrics.get('match_weight_min', 0):.4f} "
+                    f"mw_bmin={train_metrics.get('match_weight_batch_min_mean', 0):.4f} "
                     f"nn_dist={train_metrics.get('match_nn_distance_mm_mean', 0):.2f}mm "
                     f"mprob={train_metrics.get('match_probability_mean', 0):.4f} "
                     f"{train_stage_text} "

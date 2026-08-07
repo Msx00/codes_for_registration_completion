@@ -67,8 +67,8 @@ def _compute_eval_match_loss(
     zero_diag = {
         "loss": zero,
         "match_weight_mean": zero,
-        "match_weight_min": zero,
-        "match_weight_max": zero,
+        "match_weight_batch_min": zero,
+        "match_weight_batch_max": zero,
         "match_nn_distance_mm_mean": zero,
         "match_nn_distance_mm_median": zero,
         "match_probability_mean": zero,
@@ -107,8 +107,8 @@ def _compute_eval_match_loss(
     return {
         "loss": L_match,
         "match_weight_mean": match_weight.mean(),
-        "match_weight_min": match_weight.min(),
-        "match_weight_max": match_weight.max(),
+        "match_weight_batch_min": match_weight.min(),
+        "match_weight_batch_max": match_weight.max(),
         "match_nn_distance_mm_mean": match_nn_distance_mm.mean(),
         "match_nn_distance_mm_median": match_nn_distance_mm.median(),
         "match_probability_mean": matched_probability.mean(),
@@ -236,13 +236,13 @@ def evaluate(model, loader, device, args):
 
         score_weights = out.get("score_weights")
         if score_weights is not None:
-            stats[14] += score_weights[0].double()
-            stats[15] += score_weights[1].double()
-            stats[16] += score_weights[2].double()
+            stats[14] += score_weights[0].double() * batch_size
+            stats[15] += score_weights[1].double() * batch_size
+            stats[16] += score_weights[2].double() * batch_size
 
         # match diagnostics
         for idx, key in enumerate(
-            ["match_weight_mean", "match_weight_min", "match_weight_max",
+            ["match_weight_mean", "match_weight_batch_min", "match_weight_batch_max",
              "match_nn_distance_mm_mean", "match_nn_distance_mm_median",
              "match_probability_mean"],
             start=17,
@@ -279,8 +279,8 @@ def evaluate(model, loader, device, args):
         "score_weight_feature": (stats[15] / sample_count).item(),
         "score_weight_geometry": (stats[16] / sample_count).item(),
         "eval_match_weight_mean": (stats[17] / sample_count).item(),
-        "eval_match_weight_min": (stats[18] / sample_count).item(),
-        "eval_match_weight_max": (stats[19] / sample_count).item(),
+        "eval_match_weight_batch_min_mean": (stats[18] / sample_count).item(),
+        "eval_match_weight_batch_max_mean": (stats[19] / sample_count).item(),
         "eval_match_nn_distance_mm_mean": (stats[20] / sample_count).item(),
         "eval_match_nn_distance_mm_median": (stats[21] / sample_count).item(),
         "eval_match_probability_mean": (stats[22] / sample_count).item(),
