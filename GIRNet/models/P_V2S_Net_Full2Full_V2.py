@@ -210,7 +210,9 @@ class PV2SNetFull2FullV2(nn.Module):
             *refined_warps,
         ]
 
-        # target_global_xyz is already in mm (the original target coords).
+        # target_global_xyz is in GIRNet normalized coordinates.
+        # The wrapper (GIRNet_text_model.forward) inverse-transforms
+        # it back to mm before passing it to compute_match_loss.
         target_global_xyz = target_global_coords_cf.transpose(1, 2).contiguous()
 
         return {

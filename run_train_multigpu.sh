@@ -5,15 +5,15 @@ PROJECT_DIR="/home/ma_sx/Project/Liver2"
 CONDA_HOME="${CONDA_HOME:-/home/ma_sx/miniconda3}"
 CONDA_ENV="${CONDA_ENV:-liver}"
 
-GPU_IDS="${GPU_IDS:-0,1,2}"
-WORLD_SIZE="${WORLD_SIZE:-3}"
+GPU_IDS="${GPU_IDS:-0,1,2,3}"
+WORLD_SIZE="${WORLD_SIZE:-4}"
 
 DATASET_ROOT="${DATASET_ROOT:-/home/ma_sx/Project/Dataset/MedShapeNet-Liver}"
 SAVE_DIR="${SAVE_DIR:-${PROJECT_DIR}/logs/spaq_GIRNet_$(date +%Y%m%d_%H%M%S)}"
 MAX_TRAIN_SAMPLES="${MAX_TRAIN_SAMPLES:-1000}"
 MAX_VAL_SAMPLES="${MAX_VAL_SAMPLES:-100}"
 
-EPOCHS="${EPOCHS:-200}"
+EPOCHS="${EPOCHS:-300}"
 BATCH_SIZE="${BATCH_SIZE:-4}"
 
 # --- Training stage ---

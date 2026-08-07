@@ -173,6 +173,33 @@ class LiverCompletionDataset(torch.utils.data.Dataset):
                 f"Randomly limited validation cases: "
                 f"{old_count} -> {len(self.cases['validation'])}"
             )
+        max_test_samples = getattr(args, "max_test_samples", -1)
+
+        if (
+            max_test_samples is not None
+            and max_test_samples > 0
+            and len(self.cases["test"]) > max_test_samples
+        ):
+            old_count = len(self.cases["test"])
+
+            subset_rng = np.random.default_rng(dataset_seed + 2)
+
+            selected_indices = subset_rng.choice(
+                old_count,
+                size=max_test_samples,
+                replace=False,
+            )
+
+            self.cases["test"] = [
+                self.cases["test"][int(i)]
+                for i in selected_indices
+            ]
+
+            print(
+                f"Randomly limited test cases: "
+                f"{old_count} -> {len(self.cases['test'])}"
+            )
+
         assert len(self.cases["train"]) + len(self.cases["validation"]) + len(self.cases["test"]) > 0, f"No cases found under {root}"
         print(f"Total cases found in train: {len(self.cases['train'])}")
         print(f"Total cases found in validation: {len(self.cases['validation'])}")

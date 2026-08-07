@@ -278,6 +278,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset_root", type=str, default="/home/ma_sx/Project/Dataset/MedShapeNet-Liver")
     parser.add_argument("--data_overlap", type=float, default=0.8)
+    parser.add_argument("--max_test_samples", type=int, default=-1)
     parser.add_argument("--checkpoint", type=str, required=True)
     parser.add_argument("--output_dir", type=str, default="/home/ma_sx/Project/Liver/test_results")
     parser.add_argument("--batch_size", type=int, default=1)

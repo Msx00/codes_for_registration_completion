@@ -165,6 +165,8 @@ def compute_match_loss(
 ):
     """Supervise GlobalMatcher assignment using GT nearest-neighbor labels.
 
+    All coordinates must be in the same physical coordinate system (mm).
+
     Args:
         global_assignment: (B, Ns_coarse, Nt_coarse) dual-softmax assignment.
         source_global_indices: (B, Ns_coarse) long, coarse src -> full src indices.
@@ -173,10 +175,27 @@ def compute_match_loss(
         match_sigma_mm: Gaussian bandwidth for match weight (mm).
 
     Returns:
-        L_match scalar (float32).
+        dict with keys: loss, match_weight_mean, match_weight_min,
+        match_weight_max, match_nn_distance_mm_mean,
+        match_nn_distance_mm_median, match_probability_mean.
+        When inputs are None, returns a zero-filled dict.
     """
+    zero_diagnostics = {
+        "loss": torch.tensor(0.0, device=gt_xyz.device, dtype=torch.float32),
+        "match_weight_mean": torch.tensor(0.0, device=gt_xyz.device, dtype=torch.float32),
+        "match_weight_min": torch.tensor(0.0, device=gt_xyz.device, dtype=torch.float32),
+        "match_weight_max": torch.tensor(0.0, device=gt_xyz.device, dtype=torch.float32),
+        "match_nn_distance_mm_mean": torch.tensor(0.0, device=gt_xyz.device, dtype=torch.float32),
+        "match_nn_distance_mm_median": torch.tensor(0.0, device=gt_xyz.device, dtype=torch.float32),
+        "match_probability_mean": torch.tensor(0.0, device=gt_xyz.device, dtype=torch.float32),
+    }
     if global_assignment is None or source_global_indices is None:
-        return torch.tensor(0.0, device=gt_xyz.device, dtype=torch.float32)
+        return zero_diagnostics
+
+    if not torch.isfinite(target_global_xyz).all():
+        raise RuntimeError("target_global_xyz contains non-finite values")
+    if not torch.isfinite(gt_xyz).all():
+        raise RuntimeError("gt_xyz contains non-finite values")
 
     # Gather GT points at the coarse source positions.
     gt_coarse = _batched_gather(gt_xyz, source_global_indices)  # (B, Ns, 3)
@@ -193,14 +212,32 @@ def compute_match_loss(
             -min_distance2 / (2.0 * match_sigma_mm ** 2)
         )  # (B, Ns)
 
+        if not torch.isfinite(match_weight).all():
+            raise RuntimeError("match_weight contains non-finite values")
+
+        match_nn_distance_mm = torch.sqrt(min_distance2.clamp_min(1e-12))
+
     matched_probability = global_assignment.float().gather(
         dim=-1, index=pseudo_target_index.unsqueeze(-1)
     ).squeeze(-1)  # (B, Ns)
 
+    weight_sum = match_weight.sum().clamp_min(1e-8)
     L_match = -(
         match_weight * torch.log(matched_probability.clamp_min(1e-8))
-    ).sum() / match_weight.sum().clamp_min(1e-8)
-    return L_match
+    ).sum() / weight_sum
+
+    if not torch.isfinite(L_match):
+        raise RuntimeError(f"L_match is non-finite: {L_match}")
+
+    return {
+        "loss": L_match,
+        "match_weight_mean": match_weight.mean().detach(),
+        "match_weight_min": match_weight.min().detach(),
+        "match_weight_max": match_weight.max().detach(),
+        "match_nn_distance_mm_mean": match_nn_distance_mm.mean().detach(),
+        "match_nn_distance_mm_median": match_nn_distance_mm.median().detach(),
+        "match_probability_mean": matched_probability.mean().detach(),
+    }
 
 
 def auxiliary_stage_huber_loss(pred_stages, gt, weights, beta_mm):
@@ -270,7 +307,7 @@ def train_one_epoch(
     # loss sums, gradient sums, source squared error, confidence sum,
     # sample/point/confidence/batch counts, non-finite gradient batch count,
     # then one squared-error sum per stage, plus score weight sums (3).
-    base_meter_count = len(loss_names) + 12
+    base_meter_count = len(loss_names) + 18
     meters = torch.zeros(
         base_meter_count + len(stage_names),
         device=device,
@@ -340,15 +377,20 @@ def train_one_epoch(
 
                 # --- match loss (full2full_v2 only) ---
                 if args.w_match > 0 and args.GIRNet_arch == "full2full_v2":
-                    L_match = compute_match_loss(
+                    match_out = compute_match_loss(
                         out.get("global_assignment"),
                         out.get("source_global_indices"),
                         out.get("target_global_xyz"),
                         batch["gt_xyz"],
                         args.match_sigma_mm,
                     )
+                    L_match = match_out["loss"]
+                    match_diag = {
+                        k: v for k, v in match_out.items() if k != "loss"
+                    }
                 else:
                     L_match = torch.tensor(0.0, device=device)
+                    match_diag = {}
 
                 # --- physics (off by default) ---
                 if args.w_phys > 0:
@@ -511,6 +553,15 @@ def train_one_epoch(
                     meters[offset + 10] += 0.0
                     meters[offset + 11] += 0.0
 
+                # match diagnostics
+                if match_diag:
+                    meters[offset + 12] += match_diag.get("match_weight_mean", 0.0).double()
+                    meters[offset + 13] += match_diag.get("match_weight_min", 0.0).double()
+                    meters[offset + 14] += match_diag.get("match_weight_max", 0.0).double()
+                    meters[offset + 15] += match_diag.get("match_nn_distance_mm_mean", 0.0).double()
+                    meters[offset + 16] += match_diag.get("match_nn_distance_mm_median", 0.0).double()
+                    meters[offset + 17] += match_diag.get("match_probability_mean", 0.0).double()
+
                 stage_offset = base_meter_count
                 for stage_index, stage_pred in enumerate(pred_stages):
                     stage_squared = (
@@ -546,6 +597,12 @@ def train_one_epoch(
     metrics["score_weight_spatial"] = (meters[offset + 9] / batch_count).item()
     metrics["score_weight_feature"] = (meters[offset + 10] / batch_count).item()
     metrics["score_weight_geometry"] = (meters[offset + 11] / batch_count).item()
+    metrics["match_weight_mean"] = (meters[offset + 12] / batch_count).item()
+    metrics["match_weight_min"] = (meters[offset + 13] / batch_count).item()
+    metrics["match_weight_max"] = (meters[offset + 14] / batch_count).item()
+    metrics["match_nn_distance_mm_mean"] = (meters[offset + 15] / batch_count).item()
+    metrics["match_nn_distance_mm_median"] = (meters[offset + 16] / batch_count).item()
+    metrics["match_probability_mean"] = (meters[offset + 17] / batch_count).item()
     for stage_index, stage_name in enumerate(stage_names):
         metrics[f"{stage_name}_point_rmse"] = torch.sqrt(
             meters[base_meter_count + stage_index] / point_count
@@ -1017,6 +1074,10 @@ def main_worker(rank, world_size, args_dict):
                     f"mse={train_metrics['reg_mse']:.6f} "
                     f"cd={train_metrics['reg_cd']:.6f} "
                     f"match={train_metrics.get('match_loss', 0):.6f} "
+                    f"mw_mean={train_metrics.get('match_weight_mean', 0):.4f} "
+                    f"mw_min={train_metrics.get('match_weight_min', 0):.4f} "
+                    f"nn_dist={train_metrics.get('match_nn_distance_mm_mean', 0):.2f}mm "
+                    f"mprob={train_metrics.get('match_probability_mean', 0):.4f} "
                     f"{train_stage_text} "
                     f"final_point_rmse={train_metrics['final_point_rmse']:.4f}mm "
                     f"source_rmse={train_metrics['source_point_rmse']:.4f}mm "
@@ -1050,6 +1111,9 @@ def main_worker(rank, world_size, args_dict):
                     f"mse={eval_metrics['eval_reg_mse']:.6f} "
                     f"cd={eval_metrics['eval_reg_cd']:.6f} "
                     f"match={eval_metrics.get('eval_match_loss', 0):.6f} "
+                    f"mw_mean={eval_metrics.get('eval_match_weight_mean', 0):.4f} "
+                    f"nn_dist={eval_metrics.get('eval_match_nn_distance_mm_mean', 0):.2f}mm "
+                    f"mprob={eval_metrics.get('eval_match_probability_mean', 0):.4f} "
                     f"{eval_stage_text} "
                     f"final_point_rmse={eval_metrics['eval_final_point_rmse']:.4f}mm "
                     f"source_rmse={eval_metrics['eval_source_point_rmse']:.4f}mm "

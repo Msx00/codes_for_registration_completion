@@ -238,11 +238,11 @@ class TextConditionedGIRNet(nn.Module):
 
     @staticmethod
     def _normalize_for_GIRNet(src_xyz, part_xyz, eps=1e-6):
-        centroid = src_xyz.mean(dim=1, keepdim=True)
-        src_centered = src_xyz - centroid
+        centroid = src_xyz.float().mean(dim=1, keepdim=True)
+        src_centered = src_xyz.float() - centroid
         scale = torch.linalg.norm(src_centered, dim=-1).amax(dim=1, keepdim=True)
         scale = scale.clamp_min(eps).unsqueeze(-1)
-        return src_centered / scale, (part_xyz - centroid) / scale, scale
+        return (src_centered / scale).to(dtype=src_xyz.dtype), (part_xyz.float() - centroid).to(dtype=part_xyz.dtype) / scale, centroid, scale
 
     @staticmethod
     def _break_exact_duplicates(xyz, eps=1e-3):
@@ -448,7 +448,7 @@ class TextConditionedGIRNet(nn.Module):
         elif freeze_completion:
             registration_target = registration_target.detach()
 
-        src_norm, part_norm, scale = self._normalize_for_GIRNet(
+        src_norm, part_norm, centroid, scale = self._normalize_for_GIRNet(
             src_xyz, registration_target
         )
         if self.use_text:
@@ -488,7 +488,18 @@ class TextConditionedGIRNet(nn.Module):
             global_match_confidence = results["global_match_confidence"]
             global_assignment = results.get("global_assignment")
             source_global_indices = results.get("source_global_indices")
-            target_global_xyz = results.get("target_global_xyz")
+            # target_global_xyz from backbone is in GIRNet normalized
+            # coordinates.  Inverse-transform to mm so that
+            # compute_match_loss can compare it with gt_xyz (mm) using
+            # match_sigma_mm (mm).
+            target_global_xyz_normalized = results.get("target_global_xyz")
+            if target_global_xyz_normalized is not None:
+                target_global_xyz = (
+                    target_global_xyz_normalized.float() * scale.float()
+                    + centroid.float()
+                )
+            else:
+                target_global_xyz = None
             score_weights = results.get("score_weights")
 
         # Always return completion outputs for metric logging.

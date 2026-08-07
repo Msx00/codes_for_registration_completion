@@ -59,9 +59,27 @@ def _compute_eval_match_loss(
     gt_xyz,
     match_sigma_mm,
 ):
-    """Compute L_match for evaluation (same formula as training)."""
+    """Compute L_match for evaluation (same formula as training).
+
+    Returns dict with loss + diagnostics. All coords must be in mm.
+    """
+    zero = torch.tensor(0.0, device=gt_xyz.device, dtype=torch.float32)
+    zero_diag = {
+        "loss": zero,
+        "match_weight_mean": zero,
+        "match_weight_min": zero,
+        "match_weight_max": zero,
+        "match_nn_distance_mm_mean": zero,
+        "match_nn_distance_mm_median": zero,
+        "match_probability_mean": zero,
+    }
     if global_assignment is None or source_global_indices is None:
-        return torch.tensor(0.0, device=gt_xyz.device, dtype=torch.float32)
+        return zero_diag
+
+    if not torch.isfinite(target_global_xyz).all():
+        return zero_diag
+    if not torch.isfinite(gt_xyz).all():
+        return zero_diag
 
     gt_coarse = _batched_gather(gt_xyz, source_global_indices)
     with torch.no_grad():
@@ -75,15 +93,26 @@ def _compute_eval_match_loss(
         match_weight = torch.exp(
             -min_distance2 / (2.0 * match_sigma_mm ** 2)
         )
+        match_nn_distance_mm = torch.sqrt(min_distance2.clamp_min(1e-12))
 
     matched_probability = global_assignment.float().gather(
         dim=-1, index=pseudo_target_index.unsqueeze(-1)
     ).squeeze(-1)
 
+    weight_sum = match_weight.sum().clamp_min(1e-8)
     L_match = -(
         match_weight * torch.log(matched_probability.clamp_min(1e-8))
-    ).sum() / match_weight.sum().clamp_min(1e-8)
-    return L_match
+    ).sum() / weight_sum
+
+    return {
+        "loss": L_match,
+        "match_weight_mean": match_weight.mean(),
+        "match_weight_min": match_weight.min(),
+        "match_weight_max": match_weight.max(),
+        "match_nn_distance_mm_mean": match_nn_distance_mm.mean(),
+        "match_nn_distance_mm_median": match_nn_distance_mm.median(),
+        "match_probability_mean": matched_probability.mean(),
+    }
 
 
 @torch.no_grad()
@@ -110,7 +139,7 @@ def evaluate(model, loader, device, args):
     # 12: sample_count
     # 13: point_l1_sum (for MAE)
     # 14-16: score_weight sums
-    base_count = 17
+    base_count = 23
     stats = torch.zeros(
         base_count + len(stage_names),
         device=device,
@@ -177,9 +206,9 @@ def evaluate(model, loader, device, args):
         point_l1 = (pred.float() - gt.float()).abs().sum(dim=-1)
 
         # Match loss (full2full_v2 only).
-        match_loss = torch.tensor(0.0, device=device)
+        match_out = {"loss": torch.tensor(0.0, device=device)}
         if args.GIRNet_arch == "full2full_v2":
-            match_loss = _compute_eval_match_loss(
+            match_out = _compute_eval_match_loss(
                 out.get("global_assignment"),
                 out.get("source_global_indices"),
                 out.get("target_global_xyz"),
@@ -195,7 +224,7 @@ def evaluate(model, loader, device, args):
         stats[5] += completion_gt_cd.double() * batch_size
         stats[6] += pred_completed_cd.double() * batch_size
         stats[7] += pred_gt_cd.double() * batch_size
-        stats[8] += match_loss.double() * batch_size
+        stats[8] += match_out["loss"].double() * batch_size
 
         confidence = out.get("global_match_confidence")
         if confidence is not None:
@@ -210,6 +239,16 @@ def evaluate(model, loader, device, args):
             stats[14] += score_weights[0].double()
             stats[15] += score_weights[1].double()
             stats[16] += score_weights[2].double()
+
+        # match diagnostics
+        for idx, key in enumerate(
+            ["match_weight_mean", "match_weight_min", "match_weight_max",
+             "match_nn_distance_mm_mean", "match_nn_distance_mm_median",
+             "match_probability_mean"],
+            start=17,
+        ):
+            val = match_out.get(key, torch.tensor(0.0, device=device))
+            stats[idx] += val.double() * batch_size
 
         for index, stage_pred in enumerate(pred_stages):
             squared = (stage_pred.float() - gt.float()).square().sum(dim=-1)
@@ -239,6 +278,12 @@ def evaluate(model, loader, device, args):
         "score_weight_spatial": (stats[14] / sample_count).item(),
         "score_weight_feature": (stats[15] / sample_count).item(),
         "score_weight_geometry": (stats[16] / sample_count).item(),
+        "eval_match_weight_mean": (stats[17] / sample_count).item(),
+        "eval_match_weight_min": (stats[18] / sample_count).item(),
+        "eval_match_weight_max": (stats[19] / sample_count).item(),
+        "eval_match_nn_distance_mm_mean": (stats[20] / sample_count).item(),
+        "eval_match_nn_distance_mm_median": (stats[21] / sample_count).item(),
+        "eval_match_probability_mean": (stats[22] / sample_count).item(),
     }
     for index, stage_name in enumerate(stage_names):
         metrics[f"eval_{stage_name}_point_rmse"] = torch.sqrt(

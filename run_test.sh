@@ -9,11 +9,12 @@ GPU_ID="${GPU_ID:-1}"
 DATASET_ROOT="${DATASET_ROOT:-/home/ma_sx/Project/Dataset/MedShapeNet-Liver}"
 BATCH_SIZE="${BATCH_SIZE:-1}"
 DATA_OVERLAP="${DATA_OVERLAP:-0.25}"
+MAX_TEST_SAMPLES="${MAX_TEST_SAMPLES:-200}"
 
 BERT_MODEL="${BERT_MODEL:-${PROJECT_DIR}/bert-base-uncased}"
 LEGACY_PIVOTS_CKPT="${LEGACY_PIVOTS_CKPT:-${PROJECT_DIR}/PIVOTS/checkpoints/pivots_v5/0/best_model.pth}"
 COMPLETION_CKPT="${COMPLETION_CKPT:-${PROJECT_DIR}/completion/logs/full_aug_20260805_013524/best.pth}"
-CHECKPOINT="${CHECKPOINT:-${PROJECT_DIR}/logs/spaq_pivots_20260806_015604/best.pth}"
+CHECKPOINT="${CHECKPOINT:-${PROJECT_DIR}/logs/spaq_GIRNet_20260807_023630/best.pth}"
 
 if [[ ! -f "${CHECKPOINT}" ]]; then
   echo "[Error] checkpoint not found: ${CHECKPOINT}" >&2
@@ -42,12 +43,12 @@ echo "[Info] COMPLETION_CKPT=${COMPLETION_CKPT}"
 python test_pivots_text.py \
   --dataset_root "${DATASET_ROOT}" \
   --data_overlap "${DATA_OVERLAP}" \
+  --max_test_samples "${MAX_TEST_SAMPLES}" \
   --checkpoint "${CHECKPOINT}" \
   --output_dir "${OUTPUT_DIR}" \
   --batch_size "${BATCH_SIZE}" \
   --device "cuda:0" \
   --bert_model_name "${BERT_MODEL}" \
   --bert_local_files_only \
-  --pivots_checkpoint "${LEGACY_PIVOTS_CKPT}" \
   --completion_checkpoint "${COMPLETION_CKPT}" \
   "$@"
