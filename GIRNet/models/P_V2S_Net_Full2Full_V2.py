@@ -224,4 +224,11 @@ class PV2SNetFull2FullV2(nn.Module):
             "source_global_indices": source_global_indices,
             "target_global_xyz": target_global_xyz,
             "score_weights": match["score_weights"],
+            # Coarse diagnostics — flow intermediates in normalized coords.
+            "global_raw_coarse_flow": match["raw_coarse_flow"],
+            "global_pre_tanh_coarse_flow": match["pre_tanh_coarse_flow"],
+            "global_coarse_flow": match["coarse_flow"],
+            "global_confidence_gate": match["confidence_gate"],
+            "global_learned_gate": match["learned_gate"],
+            "global_coarse_gate": match["coarse_gate"],
         }

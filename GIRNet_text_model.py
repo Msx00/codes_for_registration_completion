@@ -478,6 +478,12 @@ class TextConditionedGIRNet(nn.Module):
             source_global_indices = None
             target_global_xyz = None
             score_weights = None
+            global_raw_coarse_flow_mm = None
+            global_pre_tanh_coarse_flow_mm = None
+            global_coarse_flow_mm = None
+            global_confidence_gate = None
+            global_learned_gate = None
+            global_coarse_gate = None
         else:
             normalized_flow_stages = results["flow_stages"]
             pred_stages_xyz = [
@@ -502,6 +508,22 @@ class TextConditionedGIRNet(nn.Module):
                 target_global_xyz = None
             score_weights = results.get("score_weights")
 
+            # Coarse flow diagnostics: convert from normalized to mm.
+            # Flow is displacement (not position), so multiply by scale only.
+            def _flow_to_mm(key_norm):
+                flow_norm = results.get(key_norm)
+                if flow_norm is not None:
+                    return flow_norm.float() * scale.float()
+                return None
+
+            global_raw_coarse_flow_mm = _flow_to_mm("global_raw_coarse_flow")
+            global_pre_tanh_coarse_flow_mm = _flow_to_mm("global_pre_tanh_coarse_flow")
+            global_coarse_flow_mm = _flow_to_mm("global_coarse_flow")
+
+            global_confidence_gate = results.get("global_confidence_gate")
+            global_learned_gate = results.get("global_learned_gate")
+            global_coarse_gate = results.get("global_coarse_gate")
+
         # Always return completion outputs for metric logging.
         return {
             "pred_xyz": pred_xyz,
@@ -513,4 +535,11 @@ class TextConditionedGIRNet(nn.Module):
             "source_global_indices": source_global_indices,
             "target_global_xyz": target_global_xyz,
             "score_weights": score_weights,
+            # Coarse diagnostics in mm.
+            "global_raw_coarse_flow_mm": global_raw_coarse_flow_mm,
+            "global_pre_tanh_coarse_flow_mm": global_pre_tanh_coarse_flow_mm,
+            "global_coarse_flow_mm": global_coarse_flow_mm,
+            "global_confidence_gate": global_confidence_gate,
+            "global_learned_gate": global_learned_gate,
+            "global_coarse_gate": global_coarse_gate,
         }

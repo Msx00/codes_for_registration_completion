@@ -1134,6 +1134,26 @@ def main_worker(rank, world_size, args_dict):
                     f"sw_geom={eval_metrics.get('score_weight_geometry', 0):.3f}"
                 )
 
+                if args.GIRNet_arch in ("full2full_v1", "full2full_v2"):
+                    coarse_diag = (
+                        f"\n[CoarseDiag] "
+                        f"srcG={eval_metrics.get('eval_source_global_point_rmse', 0):.2f}mm "
+                        f"oracle={eval_metrics.get('eval_oracle_candidate_point_rmse', 0):.2f}mm "
+                        f"raw={eval_metrics.get('eval_raw_match_point_rmse', 0):.2f}mm "
+                        f"pre={eval_metrics.get('eval_pre_tanh_match_point_rmse', 0):.2f}mm "
+                        f"gated={eval_metrics.get('eval_gated_global_match_point_rmse', 0):.2f}mm "
+                        f"rawFlow={eval_metrics.get('eval_global_raw_flow_mm_mean', 0):.2f}mm "
+                        f"preFlow={eval_metrics.get('eval_global_pre_tanh_flow_mm_mean', 0):.2f}mm "
+                        f"gateFlow={eval_metrics.get('eval_global_coarse_flow_mm_mean', 0):.2f}mm "
+                        f"confGate={eval_metrics.get('eval_confidence_gate_mean', 0):.4f} "
+                        f"learnGate={eval_metrics.get('eval_learned_gate', 0):.4f} "
+                        f"gate={eval_metrics.get('eval_coarse_gate_mean', 0):.4f}"
+                    )
+                else:
+                    coarse_diag = ""
+                if coarse_diag:
+                    print(coarse_diag)
+
                 # 保存checkpoint (只在rank 0保存)
                 last_ckpt = {
                     'epoch': epoch,

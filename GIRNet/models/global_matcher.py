@@ -327,14 +327,19 @@ class GlobalMatcherV2(nn.Module):
 
             matched_target = torch.matmul(assignment, target_coords_fp32)
             raw_coarse_flow = matched_target - source_coords_fp32
-            coarse_flow = coarse_gate.unsqueeze(-1) * raw_coarse_flow
+            pre_tanh_coarse_flow = coarse_gate.unsqueeze(-1) * raw_coarse_flow
             max_flow = max(self.max_coarse_flow, 1e-6)
-            coarse_flow = max_flow * torch.tanh(coarse_flow / max_flow)
+            coarse_flow = max_flow * torch.tanh(pre_tanh_coarse_flow / max_flow)
 
         return {
             "coarse_flow": coarse_flow.to(dtype=output_dtype),
             "assignment": assignment.to(dtype=output_dtype),
             "match_confidence": confidence.to(dtype=output_dtype),
-            "coarse_gate": coarse_gate.to(dtype=output_dtype),
             "score_weights": score_weights.detach(),
+            # Diagnostics — flow intermediates in normalized coords.
+            "raw_coarse_flow": raw_coarse_flow.to(dtype=output_dtype),
+            "pre_tanh_coarse_flow": pre_tanh_coarse_flow.to(dtype=output_dtype),
+            "confidence_gate": confidence_gate.to(dtype=output_dtype),
+            "learned_gate": learned_gate.to(dtype=output_dtype),
+            "coarse_gate": coarse_gate.to(dtype=output_dtype),
         }

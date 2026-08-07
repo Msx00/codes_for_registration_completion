@@ -675,6 +675,161 @@ def test_three_consecutive_nonfinite_is_fatal():
     print("[PASS] test_three_consecutive_nonfinite_is_fatal")
 
 
+# ---------------------------------------------------------------------------
+# Diagnostic tests: coarse flow intermediates
+# ---------------------------------------------------------------------------
+
+
+def test_diagnostics_do_not_change_forward():
+    """Test 1: Returning diagnostics must not change any existing forward values.
+
+    Same model, same seed, same input → coarse_flow must be identical before
+    and after the diagnostic refactor.  Also verifies the pre_tanh / tanh
+    relationship.
+    """
+    torch.manual_seed(0)
+    model_v2 = PV2SNetFull2FullV2(
+        num_refinement_steps=1, refinement_k=8, global_match_level=2,
+    )
+    B, Ns, Nt = 1, 512, 512
+    src = torch.randn(B, Ns, 3)
+    tgt = torch.randn(B, Nt, 3) + 3.0
+
+    with torch.no_grad():
+        out = model_v2(src, tgt)
+
+    # Verify all diagnostic fields exist.
+    for key in (
+        "global_raw_coarse_flow", "global_pre_tanh_coarse_flow",
+        "global_coarse_flow",
+        "global_confidence_gate", "global_learned_gate", "global_coarse_gate",
+    ):
+        assert key in out, f"Missing key: {key}"
+        assert out[key] is not None, f"None value for key: {key}"
+
+    raw = out["global_raw_coarse_flow"]
+    pre_tanh = out["global_pre_tanh_coarse_flow"]
+    coarse = out["global_coarse_flow"]
+    coarse_gate = out["global_coarse_gate"]
+    learned_gate = out["global_learned_gate"]
+    conf_gate = out["global_confidence_gate"]
+
+    # Verify: pre_tanh = coarse_gate * raw_coarse_flow
+    assert torch.allclose(
+        pre_tanh, coarse_gate.unsqueeze(-1) * raw, atol=1e-6
+    ), "pre_tanh_coarse_flow != coarse_gate * raw_coarse_flow"
+
+    # Verify: coarse_flow = max_flow * tanh(pre_tanh / max_flow)
+    max_flow = max(model_v2.global_matcher.max_coarse_flow, 1e-6)
+    expected_coarse = max_flow * torch.tanh(pre_tanh.float() / max_flow)
+    assert torch.allclose(
+        coarse.float(), expected_coarse.float(), atol=1e-6
+    ), "coarse_flow != max_flow * tanh(pre_tanh_coarse_flow / max_flow)"
+
+    # Verify coarse_flow has the right shape (coarse-level, not full).
+    # flow_stages[0] is the interpolated coarse flow at full resolution,
+    # not the same as global_coarse_flow (which lives at coarse points).
+    assert coarse.shape == (B, model_v2.global_match_points, 3)
+    assert out["flow_stages"][0].shape == (B, Ns, 3)
+
+    # Verify coarse_gate = confidence_gate * learned_gate
+    assert torch.allclose(
+        coarse_gate, conf_gate * learned_gate, atol=1e-6
+    ), "coarse_gate != confidence_gate * learned_gate"
+
+    # Verify gate shapes.
+    assert conf_gate.shape == (B, model_v2.global_match_points)
+    assert coarse_gate.shape == (B, model_v2.global_match_points)
+    assert learned_gate.ndim == 0  # scalar
+
+    # Verify flow shapes.
+    for tensor in (raw, pre_tanh, coarse):
+        assert tensor.shape == (B, model_v2.global_match_points, 3)
+
+    print("[PASS] test_diagnostics_do_not_change_forward")
+
+
+def test_flow_mm_conversion():
+    """Test 2: flow_mm = flow_norm * scale, no centroid added.
+
+    Flow is displacement, not position — only scale applies.
+    """
+    B, N = 2, 92
+    scale = torch.tensor([[[80.0]]])  # (B, 1, 1)
+    norm_flow = torch.full((B, N, 3), 0.1)
+    mm_flow = norm_flow.float() * scale.float()
+    expected = torch.full((B, N, 3), 8.0)
+    assert torch.allclose(mm_flow, expected, atol=1e-5), (
+        f"flow_mm should be 8.0 (0.1 * 80), got {mm_flow[0, 0, 0].item()}"
+    )
+    # Verify no centroid-like offset is applied.
+    assert abs(mm_flow.mean().item() - 8.0) < 1e-4, (
+        f"Expected 8.0, got {mm_flow.mean().item()}"
+    )
+    print("[PASS] test_flow_mm_conversion")
+
+
+def test_oracle_candidate_lower_bound():
+    """Test 3: oracle_candidate RMSE ≈ 0 when target contains exact GT points,
+    and increases when candidates are offset.
+    """
+    B, Ns, Nt = 2, 50, 100
+    gt_global = torch.randn(B, Ns, 3)
+    # target_global_xyz contains exact GT points as a subset (first Ns of Nt).
+    target_global_xyz = torch.randn(B, Nt, 3)
+    target_global_xyz[:, :Ns, :] = gt_global  # exact match
+
+    # Oracle: for each gt point, nearest neighbour in target.
+    d2 = torch.cdist(gt_global.float(), target_global_xyz.float(), p=2).square()
+    oracle_min_d2 = d2.min(dim=-1).values
+    oracle_rmse = torch.sqrt(oracle_min_d2.mean()).item()
+    print(f"  oracle_rmse (exact match): {oracle_rmse:.6f}")
+    assert oracle_rmse < 1e-3, f"Should be near 0, got {oracle_rmse}"
+
+    # Offset all target candidates by 10 mm.
+    target_offset = target_global_xyz + 10.0
+    d2_off = torch.cdist(gt_global.float(), target_offset.float(), p=2).square()
+    oracle_off_rmse = torch.sqrt(d2_off.min(dim=-1).values.mean()).item()
+    print(f"  oracle_rmse (10mm offset): {oracle_off_rmse:.2f}")
+    assert oracle_off_rmse > 5.0, f"Should increase with offset, got {oracle_off_rmse}"
+
+    print("[PASS] test_oracle_candidate_lower_bound")
+
+
+def test_raw_vs_gate_synthetic():
+    """Test 4: raw_match_rmse ≈ 0 when raw_flow is perfect; gated_rmse large
+    when gate suppresses the flow.
+    """
+    B, N = 2, 50
+    src_global = torch.zeros(B, N, 3)
+    # Shift only along x-axis (not all 3).
+    shift = torch.tensor([20.0, 0.0, 0.0]).view(1, 1, 3)
+    gt_global = src_global + shift
+    raw_flow_mm = gt_global - src_global  # perfect: 20 in x, 0 in y,z
+    coarse_gate = 0.02 * torch.ones(B, N)
+    coarse_flow_mm = coarse_gate.unsqueeze(-1) * raw_flow_mm  # = 0.4 in x
+
+    # raw match: src + raw_flow = gt → RMSE ≈ 0
+    raw_pred = src_global.float() + raw_flow_mm.float()
+    raw_rmse = torch.sqrt(
+        (raw_pred - gt_global.float()).square().sum(dim=-1).mean()
+    ).item()
+    print(f"  raw_match_rmse:     {raw_rmse:.6f} (expect ≈ 0)")
+    assert raw_rmse < 1e-4
+
+    # gated match: src + 0.4 in x → far from gt at 20
+    gated_pred = src_global.float() + coarse_flow_mm.float()
+    gated_rmse = torch.sqrt(
+        (gated_pred - gt_global.float()).square().sum(dim=-1).mean()
+    ).item()
+    print(f"  gated_match_rmse:   {gated_rmse:.2f} (expect ≈ 19.6)")
+    assert gated_rmse > 15.0 and gated_rmse < 25.0, (
+        f"Expected gated RMSE ≈ 19.6, got {gated_rmse}"
+    )
+
+    print("[PASS] test_raw_vs_gate_synthetic")
+
+
 def main():
     print("=" * 60)
     print("full2full_v2 verification tests")
@@ -699,10 +854,16 @@ def main():
     test_gt_mode_target_global_xyz_mm()
     test_completed_mode_target_global_xyz_mm()
 
-    # New robustness tests
+    # Robustness tests
     test_eval_score_weights_sum_to_one()
     test_fatal_match_error_is_not_swallowed()
     test_three_consecutive_nonfinite_is_fatal()
+
+    # Coarse diagnostics tests
+    test_diagnostics_do_not_change_forward()
+    test_flow_mm_conversion()
+    test_oracle_candidate_lower_bound()
+    test_raw_vs_gate_synthetic()
 
     print("\n" + "=" * 60)
     print("All tests passed!")

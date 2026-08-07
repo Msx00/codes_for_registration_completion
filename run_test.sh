@@ -14,7 +14,7 @@ MAX_TEST_SAMPLES="${MAX_TEST_SAMPLES:-200}"
 BERT_MODEL="${BERT_MODEL:-${PROJECT_DIR}/bert-base-uncased}"
 LEGACY_PIVOTS_CKPT="${LEGACY_PIVOTS_CKPT:-${PROJECT_DIR}/PIVOTS/checkpoints/pivots_v5/0/best_model.pth}"
 COMPLETION_CKPT="${COMPLETION_CKPT:-${PROJECT_DIR}/completion/logs/full_aug_20260805_013524/best.pth}"
-CHECKPOINT="${CHECKPOINT:-${PROJECT_DIR}/logs/spaq_GIRNet_20260807_023630/best.pth}"
+CHECKPOINT="${CHECKPOINT:-${PROJECT_DIR}/logs/spaq_GIRNet_20260807_113931/best.pth}"
 
 if [[ ! -f "${CHECKPOINT}" ]]; then
   echo "[Error] checkpoint not found: ${CHECKPOINT}" >&2
