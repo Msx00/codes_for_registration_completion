@@ -32,6 +32,7 @@ from completion.SPAQNet.utils.liver_losses import (
     symmetric_chamfer_l1_fp32,
 )
 from loss import point_rmse, pointwise_huber_loss
+from loss_v3 import source_edge_consistency_loss
 from neohookean_loss import neohookean_loss
 from evaluate import evaluate
 from j_son import save_to_json
@@ -303,6 +304,7 @@ def train_one_epoch(
         "reg_mse",
         "reg_cd",
         "match_loss",
+        "edge_loss",
         "physics",
         "completion",
         "completion_fine",
@@ -380,8 +382,11 @@ def train_one_epoch(
                         batch["src_xyz"], pred, completed.detach(),
                     )
 
-                # --- match loss (full2full_v2 only) ---
-                if args.w_match > 0 and args.GIRNet_arch == "full2full_v2":
+                # --- match loss (V2/V3) ---
+                if (
+                    args.w_match > 0
+                    and args.GIRNet_arch in ("full2full_v2", "full2full_v3")
+                ):
                     match_out = compute_match_loss(
                         out.get("global_assignment"),
                         out.get("source_global_indices"),
@@ -396,6 +401,18 @@ def train_one_epoch(
                 else:
                     L_match = torch.tensor(0.0, device=device)
                     match_diag = {}
+
+                # --- source-index edge correspondence loss (V3 only) ---
+                if args.GIRNet_arch == "full2full_v3" and args.w_edge > 0:
+                    L_edge = source_edge_consistency_loss(
+                        pred,
+                        batch["gt_xyz"],
+                        out.get("source_knn_indices"),
+                        beta_mm=args.edge_beta_mm,
+                        edge_k=args.edge_k,
+                    )
+                else:
+                    L_edge = torch.tensor(0.0, device=device)
 
                 # --- physics (off by default) ---
                 if args.w_phys > 0:
@@ -439,6 +456,7 @@ def train_one_epoch(
                     + args.w_reg_cd_gt * L_reg_cd
                     + args.w_aux_stages * L_aux_stages
                     + args.w_match * L_match
+                    + args.w_edge * L_edge
                     + args.w_phys * L_phys
                     + args.w_completion * L_completion
                 )
@@ -519,6 +537,7 @@ def train_one_epoch(
                     L_reg_mse,
                     L_reg_cd,
                     L_match,
+                    L_edge,
                     L_phys,
                     L_completion,
                     completion_losses["loss_fine"],
@@ -843,6 +862,9 @@ def main_worker(rank, world_size, args_dict):
             initialize_from_legacy_GIRNet=args.initialize_from_legacy_GIRNet,
             debug_refinement=args.debug_refinement,
             global_gate_temperature=args.global_gate_temperature,
+            v3_feature_temperature=args.v3_feature_temperature,
+            v3_spatial_temperature=args.v3_spatial_temperature,
+            source_graph_k=args.source_graph_k,
             init_registration_checkpoint=args.init_registration_checkpoint,
         ).to(device)
         if model.completion is None:
@@ -922,7 +944,9 @@ def main_worker(rank, world_size, args_dict):
             print(f"[Info] train_stage: {args.train_stage}")
             print(f"[Info] registration_target_mode: {args.registration_target_mode}")
             print(f"[Info] GIRNet_arch: {args.GIRNet_arch}")
-            if args.GIRNet_arch in ("full2full_v1", "full2full_v2"):
+            if args.GIRNet_arch in (
+                "full2full_v1", "full2full_v2", "full2full_v3"
+            ):
                 print(
                     "[Info] global match points: "
                     f"{model.module.backbone.global_match_points}"
@@ -943,6 +967,13 @@ def main_worker(rank, world_size, args_dict):
                         "[Info] global_gate_temperature: "
                         f"{args.global_gate_temperature}"
                     )
+                if args.GIRNet_arch == "full2full_v3":
+                    print(
+                        "[Info] v3 temperatures: feature="
+                        f"{args.v3_feature_temperature}, spatial="
+                        f"{args.v3_spatial_temperature}"
+                    )
+                    print(f"[Info] source_graph_k: {args.source_graph_k}")
                 print(
                     f"[Info] num_refinement_steps: {args.num_refinement_steps}"
                 )
@@ -958,6 +989,9 @@ def main_worker(rank, world_size, args_dict):
             print(f"[Info] aux_stage_weights: {args.aux_stage_weights}")
             print(f"[Info] w_match: {args.w_match}")
             print(f"[Info] match_sigma_mm: {args.match_sigma_mm}")
+            print(f"[Info] w_edge: {args.w_edge}")
+            print(f"[Info] edge_k: {args.edge_k}")
+            print(f"[Info] edge_beta_mm: {args.edge_beta_mm}")
             print(f"[Info] w_phys: {args.w_phys}")
             print(f"[Info] w_completion: {args.w_completion}")
             print(f"[Info] amp_dtype: {args.amp_dtype}")
@@ -1081,6 +1115,7 @@ def main_worker(rank, world_size, args_dict):
                     f"mse={train_metrics['reg_mse']:.6f} "
                     f"cd={train_metrics['reg_cd']:.6f} "
                     f"match={train_metrics.get('match_loss', 0):.6f} "
+                    f"edge={train_metrics.get('edge_loss', 0):.6f} "
                     f"mw_mean={train_metrics.get('match_weight_mean', 0):.4f} "
                     f"mw_bmin={train_metrics.get('match_weight_batch_min_mean', 0):.4f} "
                     f"nn_dist={train_metrics.get('match_nn_distance_mm_mean', 0):.2f}mm "
@@ -1129,12 +1164,13 @@ def main_worker(rank, world_size, args_dict):
                     f"pred_gt_cd={eval_metrics.get('eval_pred_gt_cd', 0):.6f} "
                     f"pred_comp_cd={eval_metrics.get('eval_pred_completed_cd', 0):.6f} "
                     f"comp_gt_cd={eval_metrics.get('eval_completion_gt_cd', 0):.6f} "
+                    f"edge_err={eval_metrics.get('eval_v3_edge_error_mm', 0):.4f}mm "
                     f"sw_spat={eval_metrics.get('score_weight_spatial', 0):.3f} "
                     f"sw_feat={eval_metrics.get('score_weight_feature', 0):.3f} "
                     f"sw_geom={eval_metrics.get('score_weight_geometry', 0):.3f}"
                 )
 
-                if args.GIRNet_arch in ("full2full_v1", "full2full_v2"):
+                if args.GIRNet_arch == "full2full_v2":
                     coarse_diag = (
                         f"\n[CoarseDiag] "
                         f"srcG={eval_metrics.get('eval_source_global_point_rmse', 0):.2f}mm "
@@ -1153,6 +1189,16 @@ def main_worker(rank, world_size, args_dict):
                     coarse_diag = ""
                 if coarse_diag:
                     print(coarse_diag)
+                if args.GIRNet_arch == "full2full_v3":
+                    v3_diag = (
+                        "[V3Diag] "
+                        f"coarseDisp={eval_metrics.get('eval_v3_coarse_displacement_mm_mean', 0):.2f}mm "
+                        f"r1={eval_metrics.get('eval_v3_refine1_residual_mm_mean', 0):.2f}mm "
+                        f"r2={eval_metrics.get('eval_v3_refine2_residual_mm_mean', 0):.2f}mm "
+                        f"r3={eval_metrics.get('eval_v3_refine3_residual_mm_mean', 0):.2f}mm "
+                        f"edgeErr={eval_metrics.get('eval_v3_edge_error_mm', 0):.2f}mm"
+                    )
+                    print(v3_diag)
 
                 # 保存checkpoint (只在rank 0保存)
                 last_ckpt = {
@@ -1237,7 +1283,7 @@ def main():
     ap.add_argument('--GIRNet_checkpoint', type=str, default='')
     ap.add_argument('--strict_GIRNet_checkpoint', default=False, action=argparse.BooleanOptionalAction)
     ap.add_argument('--GIRNet_arch', type=str, default='full2full_v2',
-                    choices=['legacy', 'full2full_v1', 'full2full_v2'])
+                    choices=['legacy', 'full2full_v1', 'full2full_v2', 'full2full_v3'])
     ap.add_argument('--global_match_level', type=int, default=2)
     ap.add_argument('--global_match_temperature', type=float, default=0.1)
     ap.add_argument('--global_match_dim', type=int, default=64)
@@ -1274,6 +1320,12 @@ def main():
     ap.add_argument('--w_match', type=float, default=0.1)
     ap.add_argument('--match_sigma_mm', type=float, default=5.0)
     ap.add_argument('--global_gate_temperature', type=float, default=0.02)
+    ap.add_argument('--v3_feature_temperature', type=float, default=1.0)
+    ap.add_argument('--v3_spatial_temperature', type=float, default=1.0)
+    ap.add_argument('--source_graph_k', type=int, default=16)
+    ap.add_argument('--w_edge', type=float, default=0.0)
+    ap.add_argument('--edge_k', type=int, default=8)
+    ap.add_argument('--edge_beta_mm', type=float, default=2.0)
     ap.add_argument('--amp_dtype', type=str, default='bf16',
                     choices=['fp32', 'fp16', 'bf16'])
     ap.add_argument('--w_completion', type=float, default=0.0)
@@ -1307,8 +1359,21 @@ def main():
         ap.error('--num_refinement_steps must be at least 1')
     if args.refinement_k < 1:
         ap.error('--refinement_k must be at least 1')
+    if args.v3_feature_temperature <= 0 or args.v3_spatial_temperature <= 0:
+        ap.error('--v3 feature/spatial temperatures must be positive')
+    if args.source_graph_k < 1:
+        ap.error('--source_graph_k must be at least 1')
+    if args.edge_k < 1:
+        ap.error('--edge_k must be at least 1')
+    if args.edge_beta_mm <= 0:
+        ap.error('--edge_beta_mm must be positive')
+    if args.GIRNet_arch == 'full2full_v3' and args.edge_k > args.source_graph_k:
+        ap.error('--edge_k cannot exceed --source_graph_k for full2full_v3')
+    if args.GIRNet_arch != 'full2full_v3':
+        # Preserve V1/V2/legacy loss behaviour exactly.
+        args.w_edge = 0.0
     if (
-        args.GIRNet_arch in ('full2full_v1', 'full2full_v2')
+        args.GIRNet_arch in ('full2full_v1', 'full2full_v2', 'full2full_v3')
         and len(args.aux_stage_weights) != args.num_refinement_steps
     ):
         ap.error(

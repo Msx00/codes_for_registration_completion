@@ -23,7 +23,13 @@ REGISTRATION_TARGET_MODE="${REGISTRATION_TARGET_MODE:-gt}"
 # --- GIRNet architecture ---
 # Backward compatibility: PIVOTS_ARCH maps to GIRNET_ARCH.
 GIRNET_ARCH="${GIRNET_ARCH:-${PIVOTS_ARCH:-full2full_v2}}"
-GLOBAL_MATCH_LEVEL="${GLOBAL_MATCH_LEVEL:-2}"
+if [[ -z "${GLOBAL_MATCH_LEVEL:-}" ]]; then
+  if [[ "${GIRNET_ARCH}" == "full2full_v3" ]]; then
+    GLOBAL_MATCH_LEVEL=4
+  else
+    GLOBAL_MATCH_LEVEL=2
+  fi
+fi
 GLOBAL_MATCH_TEMPERATURE="${GLOBAL_MATCH_TEMPERATURE:-0.1}"
 GLOBAL_MATCH_DIM="${GLOBAL_MATCH_DIM:-64}"
 GLOBAL_SPATIAL_SIGMA="${GLOBAL_SPATIAL_SIGMA:-0.3}"
@@ -34,6 +40,9 @@ INITIALIZE_FROM_LEGACY_GIRNet="${INITIALIZE_FROM_LEGACY_GIRNet:-0}"
 STRICT_GIRNet_CHECKPOINT="${STRICT_GIRNet_CHECKPOINT:-1}"
 DEBUG_REFINEMENT="${DEBUG_REFINEMENT:-0}"
 GLOBAL_GATE_TEMPERATURE="${GLOBAL_GATE_TEMPERATURE:-0.02}"
+V3_FEATURE_TEMPERATURE="${V3_FEATURE_TEMPERATURE:-1.0}"
+V3_SPATIAL_TEMPERATURE="${V3_SPATIAL_TEMPERATURE:-1.0}"
+SOURCE_GRAPH_K="${SOURCE_GRAPH_K:-16}"
 
 # --- Learning rates ---
 LR="${LR:-1e-5}"
@@ -50,6 +59,9 @@ W_AUX_STAGES="${W_AUX_STAGES:-0.5}"
 AUX_STAGE_WEIGHTS="${AUX_STAGE_WEIGHTS:-0.1,0.2,0.5}"
 W_MATCH="${W_MATCH:-0.1}"
 MATCH_SIGMA_MM="${MATCH_SIGMA_MM:-5.0}"
+W_EDGE="${W_EDGE:-0.1}"
+EDGE_K="${EDGE_K:-8}"
+EDGE_BETA_MM="${EDGE_BETA_MM:-2.0}"
 W_PHYS="${W_PHYS:-0.0}"
 W_COMPLETION="${W_COMPLETION:-0.0}"
 
@@ -126,7 +138,7 @@ fi
 echo "[Info] train_stage=${TRAIN_STAGE}"
 echo "[Info] registration_target_mode=${REGISTRATION_TARGET_MODE}"
 echo "[Info] GIRNET_ARCH=${GIRNET_ARCH}"
-echo "[Info] GLOBAL_MATCH_LEVEL=${GLOBAL_MATCH_LEVEL} (default points=92)"
+echo "[Info] GLOBAL_MATCH_LEVEL=${GLOBAL_MATCH_LEVEL}"
 echo "[Info] GLOBAL_MATCH_TEMPERATURE=${GLOBAL_MATCH_TEMPERATURE}"
 echo "[Info] GLOBAL_MATCH_DIM=${GLOBAL_MATCH_DIM}"
 echo "[Info] GLOBAL_SPATIAL_SIGMA=${GLOBAL_SPATIAL_SIGMA}"
@@ -134,10 +146,14 @@ echo "[Info] MAX_COARSE_FLOW_NORMALIZED=${MAX_COARSE_FLOW_NORMALIZED}"
 echo "[Info] NUM_REFINEMENT_STEPS=${NUM_REFINEMENT_STEPS}"
 echo "[Info] REFINEMENT_K=${REFINEMENT_K}"
 echo "[Info] GLOBAL_GATE_TEMPERATURE=${GLOBAL_GATE_TEMPERATURE}"
+echo "[Info] V3_FEATURE_TEMPERATURE=${V3_FEATURE_TEMPERATURE}"
+echo "[Info] V3_SPATIAL_TEMPERATURE=${V3_SPATIAL_TEMPERATURE}"
+echo "[Info] SOURCE_GRAPH_K=${SOURCE_GRAPH_K}"
 echo "[Info] INITIALIZE_FROM_LEGACY_GIRNet=${INITIALIZE_FROM_LEGACY_GIRNet}"
 echo "[Info] LR=${LR} COMPLETION_LR=${COMPLETION_LR}"
 echo "[Info] W_REG_HUBER=${W_REG_HUBER} W_REG_MSE=${W_REG_MSE} W_REG_CD_GT=${W_REG_CD_GT} W_REG_CD_COMPLETED=${W_REG_CD_COMPLETED}"
 echo "[Info] W_AUX_STAGES=${W_AUX_STAGES} W_MATCH=${W_MATCH} MATCH_SIGMA_MM=${MATCH_SIGMA_MM}"
+echo "[Info] W_EDGE=${W_EDGE} EDGE_K=${EDGE_K} EDGE_BETA_MM=${EDGE_BETA_MM}"
 echo "[Info] W_PHYS=${W_PHYS} W_COMPLETION=${W_COMPLETION}"
 echo "[Info] AUX_STAGE_WEIGHTS=${AUX_STAGE_WEIGHTS}"
 echo "[Info] HUBER_BETA_MM=${HUBER_BETA_MM}"
@@ -200,6 +216,9 @@ python train-multigpu.py \
   --num_refinement_steps "${NUM_REFINEMENT_STEPS}" \
   --refinement_k "${REFINEMENT_K}" \
   --global_gate_temperature "${GLOBAL_GATE_TEMPERATURE}" \
+  --v3_feature_temperature "${V3_FEATURE_TEMPERATURE}" \
+  --v3_spatial_temperature "${V3_SPATIAL_TEMPERATURE}" \
+  --source_graph_k "${SOURCE_GRAPH_K}" \
   --w_reg_huber "${W_REG_HUBER}" \
   --huber_beta_mm "${HUBER_BETA_MM}" \
   --w_reg_mse "${W_REG_MSE}" \
@@ -209,6 +228,9 @@ python train-multigpu.py \
   --aux_stage_weights "${AUX_STAGE_WEIGHTS}" \
   --w_match "${W_MATCH}" \
   --match_sigma_mm "${MATCH_SIGMA_MM}" \
+  --w_edge "${W_EDGE}" \
+  --edge_k "${EDGE_K}" \
+  --edge_beta_mm "${EDGE_BETA_MM}" \
   --w_phys "${W_PHYS}" \
   --phys_k "${PHYS_K}" \
   --phys_reg "${PHYS_REG}" \
@@ -264,4 +286,13 @@ python train-multigpu.py \
 #   GIRNET_ARCH=full2full_v2 DATA_OVERLAP=0.2 LR=1e-5 \
 #   W_REG_HUBER=1.0 W_REG_MSE=0.02 W_REG_CD_GT=0.05 \
 #   W_AUX_STAGES=0.5 W_MATCH=0.1 W_PHYS=0 W_COMPLETION=0 USE_TEXT=0 AMP_DTYPE=bf16 \
+#   ./run_train_multigpu.sh
+#
+# --- Experiment V3 — source-indexed completed registration: ---
+#   TRAIN_STAGE=registration REGISTRATION_TARGET_MODE=completed \
+#   GIRNET_ARCH=full2full_v3 GLOBAL_MATCH_LEVEL=4 DATA_OVERLAP=0.2 \
+#   LR=1e-5 W_REG_HUBER=1.0 W_REG_MSE=0.02 W_REG_CD_GT=0.05 \
+#   W_AUX_STAGES=0.5 W_MATCH=0.1 MATCH_SIGMA_MM=5.0 \
+#   W_EDGE=0.1 EDGE_K=8 EDGE_BETA_MM=2.0 \
+#   USE_TEXT=0 W_PHYS=0 W_COMPLETION=0 AMP_DTYPE=fp32 \
 #   ./run_train_multigpu.sh

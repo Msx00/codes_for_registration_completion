@@ -15,6 +15,7 @@ from models.P_V2S_Net_V5_downsampled_intraop_v2_I2P_dgcnn import (  # noqa: E402
 )
 from models.P_V2S_Net_Full2Full_V1 import PV2SNetFull2FullV1  # noqa: E402
 from models.P_V2S_Net_Full2Full_V2 import PV2SNetFull2FullV2  # noqa: E402
+from models.P_V2S_Net_Full2Full_V3 import PV2SNetFull2FullV3  # noqa: E402
 from completion.SPAQNet.models.liver_generative_completion import (  # noqa: E402
     LiverGenerativeCompletionSPAQNet,
 )
@@ -85,6 +86,9 @@ class TextConditionedGIRNet(nn.Module):
         initialize_from_legacy_GIRNet=True,
         debug_refinement=False,
         global_gate_temperature=0.02,
+        v3_feature_temperature=1.0,
+        v3_spatial_temperature=1.0,
+        source_graph_k=16,
         init_registration_checkpoint="",
     ):
         super().__init__()
@@ -143,9 +147,25 @@ class TextConditionedGIRNet(nn.Module):
                 enc_freq_scale=1,
                 debug_refinement=debug_refinement,
             )
+        elif GIRNet_arch == "full2full_v3":
+            self.backbone = PV2SNetFull2FullV3(
+                feature_dim=50,
+                points_per_region=35,
+                global_match_level=global_match_level,
+                global_match_dim=global_match_dim,
+                feature_temperature=v3_feature_temperature,
+                spatial_temperature=v3_spatial_temperature,
+                num_refinement_steps=num_refinement_steps,
+                refinement_k=refinement_k,
+                source_graph_k=source_graph_k,
+                enc_freq=(2e-2, 2e-1, 2, 4, 8, 16, 32, 64),
+                enc_freq_scale=1,
+                debug_refinement=debug_refinement,
+            )
         else:
             raise ValueError(
-                f"Unsupported GIRNet_arch={GIRNet_arch!r}; expected legacy, full2full_v1, or full2full_v2"
+                f"Unsupported GIRNet_arch={GIRNet_arch!r}; expected legacy, "
+                "full2full_v1, full2full_v2, or full2full_v3"
             )
         self.text_film = BertFiLM(
             out_channels=50,
@@ -348,64 +368,72 @@ class TextConditionedGIRNet(nn.Module):
                 print(f"  - {key}")
 
     def _init_registration_from_checkpoint(self, checkpoint_path):
-        """Load registration-only weights from a GT-pretrained full2full_v2 checkpoint.
-
-        Only loads GIRNet backbone, GlobalMatcher, and iterative refiner parameters.
-        Does NOT load optimizer, GradScaler, epoch, SPAQNet params, or best metric.
-        """
-        if self.GIRNet_arch != "full2full_v2":
+        """Load registration-only weights from a same-architecture checkpoint."""
+        if self.GIRNet_arch not in ("full2full_v2", "full2full_v3"):
             raise RuntimeError(
                 "--init_registration_checkpoint is only supported for "
-                f"full2full_v2, got arch={self.GIRNet_arch!r}"
+                f"full2full_v2/full2full_v3, got arch={self.GIRNet_arch!r}"
             )
+
         checkpoint = torch.load(checkpoint_path, map_location="cpu")
         checkpoint_arch = None
         if isinstance(checkpoint, dict):
             checkpoint_arch = checkpoint.get("GIRNet_arch")
             if checkpoint_arch is None:
                 checkpoint_arch = checkpoint.get("config", {}).get("GIRNet_arch")
-        if checkpoint_arch != "full2full_v2":
+        if checkpoint_arch != self.GIRNet_arch:
             raise RuntimeError(
-                "Cannot initialize full2full_v2 from a checkpoint with "
-                f"architecture={checkpoint_arch!r}; only full2full_v2 is allowed"
+                "Registration initialization requires the same architecture: "
+                f"checkpoint={checkpoint_arch!r}, requested={self.GIRNet_arch!r}"
             )
 
-        # Extract state dict, stripping "module." and "backbone." prefixes.
         state = checkpoint
         if isinstance(checkpoint, dict):
             for key in ("model", "model_state_dict", "state_dict"):
                 if key in checkpoint and isinstance(checkpoint[key], dict):
                     state = checkpoint[key]
                     break
+        if not isinstance(state, dict):
+            raise RuntimeError("Registration checkpoint has no state dict")
 
+        current = self.backbone.state_dict()
         cleaned = {}
+        shape_mismatch = []
         for key, value in state.items():
             key = key.removeprefix("module.")
-            cleaned[key] = value
+            if key.startswith("backbone."):
+                key = key.removeprefix("backbone.")
+            elif key not in current:
+                # Wrapper checkpoints also contain completion/text parameters.
+                continue
+            if key in current:
+                if current[key].shape != value.shape:
+                    shape_mismatch.append(
+                        f"{key}: checkpoint={tuple(value.shape)} "
+                        f"current={tuple(current[key].shape)}"
+                    )
+                else:
+                    cleaned[key] = value
 
-        # Filter to only registration-related keys (exclude completion, BertFiLM).
-        reg_keys = {
-            k for k in self.backbone.state_dict()
-        }
-        filtered = {k: v for k, v in cleaned.items() if k in reg_keys}
-        missing = [k for k in reg_keys if k not in cleaned]
-        unexpected = [k for k in cleaned if k not in reg_keys]
+        loaded_count = len(cleaned)
+        if loaded_count == 0:
+            raise RuntimeError(
+                "init_registration_checkpoint matched zero backbone parameters; "
+                "check checkpoint format and architecture"
+            )
+        missing = [key for key in current if key not in cleaned]
+        if missing or shape_mismatch:
+            raise RuntimeError(
+                "Same-architecture registration initialization must be strict: "
+                f"loaded={loaded_count}, missing={len(missing)}, "
+                f"shape_mismatch={len(shape_mismatch)}"
+            )
 
-        self.backbone.load_state_dict(filtered, strict=False)
-        loaded_count = len(filtered)
+        self.backbone.load_state_dict(cleaned, strict=True)
         print(
             f"[Info] init_registration_checkpoint {checkpoint_path}: "
-            f"loaded={loaded_count}, missing={len(missing)}, "
-            f"unexpected={len(unexpected)}"
+            f"strictly loaded {loaded_count} backbone tensors"
         )
-        if missing:
-            print("[Info] Registration init missing keys (first 20):")
-            for k in missing[:20]:
-                print(f"  - {k}")
-        if unexpected:
-            print("[Info] Registration init unexpected keys (first 20):")
-            for k in unexpected[:20]:
-                print(f"  - {k}")
 
     def forward(
         self,
@@ -484,6 +512,8 @@ class TextConditionedGIRNet(nn.Module):
             global_confidence_gate = None
             global_learned_gate = None
             global_coarse_gate = None
+            refinement_residuals_mm = None
+            source_knn_indices = None
         else:
             normalized_flow_stages = results["flow_stages"]
             pred_stages_xyz = [
@@ -523,6 +553,15 @@ class TextConditionedGIRNet(nn.Module):
             global_confidence_gate = results.get("global_confidence_gate")
             global_learned_gate = results.get("global_learned_gate")
             global_coarse_gate = results.get("global_coarse_gate")
+            refinement_residuals = results.get("refinement_residuals")
+            if refinement_residuals is not None:
+                refinement_residuals_mm = [
+                    residual.float() * scale.float()
+                    for residual in refinement_residuals
+                ]
+            else:
+                refinement_residuals_mm = None
+            source_knn_indices = results.get("source_knn_indices")
 
         # Always return completion outputs for metric logging.
         return {
@@ -542,4 +581,6 @@ class TextConditionedGIRNet(nn.Module):
             "global_confidence_gate": global_confidence_gate,
             "global_learned_gate": global_learned_gate,
             "global_coarse_gate": global_coarse_gate,
+            "refinement_residuals_mm": refinement_residuals_mm,
+            "source_knn_indices": source_knn_indices,
         }

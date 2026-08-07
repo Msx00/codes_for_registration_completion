@@ -5,6 +5,7 @@ from tqdm import tqdm
 
 from completion.SPAQNet.utils.liver_losses import symmetric_chamfer_l1_fp32
 from loss import pointwise_huber_loss
+from loss_v3 import source_edge_error_mm
 
 
 def registration_chamfer(source, prediction, target, eps=1e-6):
@@ -122,7 +123,10 @@ def evaluate(model, loader, device, args):
     stage_names = _stage_metric_names(
         args.GIRNet_arch, args.num_refinement_steps
     )
-    is_full2full = args.GIRNet_arch in ("full2full_v1", "full2full_v2")
+    is_full2full = args.GIRNet_arch in (
+        "full2full_v1", "full2full_v2", "full2full_v3"
+    )
+    has_v2_coarse_diag = args.GIRNet_arch == "full2full_v2"
     # learned_gate is a model-parameter scalar — identical across ranks.
     # Capture it from the last batch (no all_reduce needed).
     learned_gate_value = None
@@ -145,8 +149,11 @@ def evaluate(model, loader, device, args):
     # conf_gate_min_sum, conf_gate_max_sum, coarse_gate_min_sum, coarse_gate_max_sum
     COARSE_DIAG_COUNT = 20
     COARSE_DIAG_BASE = BASE + stage_count
+    V3_DIAG_BASE = COARSE_DIAG_BASE + COARSE_DIAG_COUNT
+    # one edge-error scalar + one motion-magnitude sum per prediction stage
+    V3_DIAG_COUNT = 1 + stage_count
     stats = torch.zeros(
-        COARSE_DIAG_BASE + COARSE_DIAG_COUNT,
+        V3_DIAG_BASE + V3_DIAG_COUNT,
         device=device,
         dtype=torch.float64,
     )
@@ -211,7 +218,7 @@ def evaluate(model, loader, device, args):
         point_l1 = (pred.float() - gt.float()).abs().sum(dim=-1)
 
         match_out = {"loss": torch.tensor(0.0, device=device)}
-        if args.GIRNet_arch == "full2full_v2":
+        if args.GIRNet_arch in ("full2full_v2", "full2full_v3"):
             match_out = _compute_eval_match_loss(
                 out.get("global_assignment"),
                 out.get("source_global_indices"),
@@ -257,8 +264,8 @@ def evaluate(model, loader, device, args):
             squared = (stage_pred.float() - gt.float()).square().sum(dim=-1)
             stats[BASE + index] += squared.sum().double()
 
-        # ---- coarse diagnostics (full2full only) ----
-        if is_full2full:
+        # ---- V2 coarse diagnostics ----
+        if has_v2_coarse_diag:
             src_g_idx = out.get("source_global_indices")
             tgt_g_xyz = out.get("target_global_xyz")
             raw_flow_mm = out.get("global_raw_coarse_flow_mm")
@@ -333,6 +340,24 @@ def evaluate(model, loader, device, args):
             if learned_gate_raw is not None:
                 learned_gate_value = learned_gate_raw.detach().float().item()
 
+        # ---- V3 correspondence/refinement diagnostics ----
+        if args.GIRNet_arch == "full2full_v3":
+            edge_error = source_edge_error_mm(
+                pred, gt, out.get("source_knn_indices"), edge_k=args.edge_k
+            )
+            stats[V3_DIAG_BASE] += edge_error.double() * batch_size
+            for stage_index, stage_pred in enumerate(pred_stages):
+                if stage_index == 0:
+                    motion = stage_pred.float() - src.float()
+                else:
+                    motion = (
+                        stage_pred.float()
+                        - pred_stages[stage_index - 1].float()
+                    )
+                stats[V3_DIAG_BASE + 1 + stage_index] += (
+                    torch.linalg.vector_norm(motion, dim=-1).sum().double()
+                )
+
     # ---- all_reduce ----
     if is_dist:
         dist.all_reduce(stats, op=dist.ReduceOp.SUM)
@@ -372,8 +397,8 @@ def evaluate(model, loader, device, args):
     metrics["eval_final_point_rmse"] = final_rmse
     metrics["eval_reg_point_rmse"] = final_rmse
 
-    # ---- coarse diagnostics (point-RMSE style) ----
-    if is_full2full:
+    # ---- V2 coarse diagnostics (point-RMSE style) ----
+    if has_v2_coarse_diag:
         src_gp = stats[CD_SRC_PT].clamp_min(1.0)
         oracle_gp = stats[CD_ORACLE_PT].clamp_min(1.0)
         flow_gp = stats[CD_FLOW_PT].clamp_min(1.0)
@@ -445,5 +470,22 @@ def evaluate(model, loader, device, args):
             "eval_learned_gate",
         ):
             metrics[key] = 0.0
+
+    if args.GIRNet_arch == "full2full_v3":
+        metrics["eval_v3_edge_error_mm"] = (
+            stats[V3_DIAG_BASE] / sample_count
+        ).item()
+        metrics["eval_v3_coarse_displacement_mm_mean"] = (
+            stats[V3_DIAG_BASE + 1] / point_count
+        ).item()
+        for step in range(1, len(stage_names)):
+            metrics[f"eval_v3_refine{step}_residual_mm_mean"] = (
+                stats[V3_DIAG_BASE + 1 + step] / point_count
+            ).item()
+    else:
+        metrics["eval_v3_edge_error_mm"] = 0.0
+        metrics["eval_v3_coarse_displacement_mm_mean"] = 0.0
+        for step in range(1, len(stage_names)):
+            metrics[f"eval_v3_refine{step}_residual_mm_mean"] = 0.0
 
     return metrics
