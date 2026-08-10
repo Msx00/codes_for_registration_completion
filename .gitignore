@@ -1,18 +1,30 @@
-
-logs/
+# Python build and cache artifacts
 __pycache__/
-bert-base-uncased
-oldcodes/
-PIVOTS/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+
+# Virtual environments and local tooling
+.venv/
+venv/
+.idea/
+.vscode/
+
+# Experiment artifacts
+logs/
 wandb/
 test_results/
-completion/__pycache__/
-completion/logs
-completion/Physics3D
-completion/SplAttN
-completion/test_results
-completion/wandb
+*.pth
+*.pt
 
-completion-only copy/
-completion-only copy 2/
-completion-old/
+# Completion-only outputs
+completion/logs/
+completion/wandb/
+completion/test_results/
+completion/inference_outputs/
+
+# Native extension builds
+build/
+dist/
+*.egg-info/
+*.so

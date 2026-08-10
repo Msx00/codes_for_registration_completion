@@ -1,0 +1,16 @@
+# Core numerical and training stack.
+# Install the CUDA-compatible PyTorch build for your machine when necessary.
+torch>=2.1
+torchvision>=0.16
+numpy>=1.26
+scipy>=1.13
+PyYAML>=6.0
+tqdm>=4.67
+einops>=0.8
+open3d>=0.19
+wandb>=0.23
+
+# Completion model utilities.
+easydict>=1.13
+scikit-learn>=1.6
+matplotlib>=3.9
