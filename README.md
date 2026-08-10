@@ -62,3 +62,8 @@ python -m liver2.evaluation.test_pipeline --checkpoint /path/to/v3/best.pth
 ```
 
 Both training and testing reject checkpoints from older GIRNet architectures.
+
+
+
+
+Corresponding paper citation is coming soon...
