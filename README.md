@@ -13,7 +13,7 @@ liver2/
 ├── training/         distributed training entry point
 ├── evaluation/       validation logic and test CLI
 └── utils/            shared persistence helpers
-completion/           SPAQNet completion component
+completion/           SPAQNet completion component (Source-Partial Adaptive Query Network for Point Cloud Completion)
 scripts/              full shell launchers
 tests/                focused V3 model tests
 ```
