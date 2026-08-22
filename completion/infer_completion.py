@@ -18,13 +18,13 @@ from tqdm import tqdm
 
 
 ROOT = Path(__file__).resolve().parent
-SPLATTN_ROOT = ROOT / "SPAQNet"
-if str(SPLATTN_ROOT) not in sys.path:
-    sys.path.insert(0, str(SPLATTN_ROOT))
+SPAQNet_ROOT = ROOT / "SPAQNet"
+if str(SPAQNet_ROOT) not in sys.path:
+    sys.path.insert(0, str(SPAQNet_ROOT))
 
-from models.liver_completion import LiverCompletionSplAttN  # noqa: E402
+from models.liver_completion import LiverCompletionSPAQNet  # noqa: E402
 from models.liver_generative_completion import (  # noqa: E402
-    LiverGenerativeCompletionSplAttN,
+    LiverGenerativeCompletionSPAQNet,
 )
 from utils.liver_data import (  # noqa: E402
     CROP_TYPES,
@@ -360,7 +360,7 @@ def main() -> None:
         raise ValueError(f"Invalid crop types: {sorted(unknown_crops)}")
 
     if generative:
-        model = LiverGenerativeCompletionSplAttN(
+        model = LiverGenerativeCompletionSPAQNet(
             feature_dim=int(saved_config.get("feature_dim", 192)),
             num_heads=int(saved_config.get("num_heads", 6)),
             k_neighbors=int(saved_config.get("k_neighbors", 12)),
@@ -373,7 +373,7 @@ def main() -> None:
             denoise_jitter=float(saved_config.get("denoise_jitter", 0.005)),
         ).to(device)
     else:
-        model = LiverCompletionSplAttN(
+        model = LiverCompletionSPAQNet(
             feature_dim=int(saved_config.get("feature_dim", 192)),
             num_heads=int(saved_config.get("num_heads", 6)),
             k_neighbors=int(saved_config.get("k_neighbors", 12)),

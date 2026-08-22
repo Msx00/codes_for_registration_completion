@@ -132,8 +132,10 @@ def evaluate(model, loader, device, args):
     V3_DIAG_BASE = BASE + stage_count
     # one edge-error scalar + one motion-magnitude sum per prediction stage
     V3_DIAG_COUNT = 1 + stage_count
+    overlap_values = [float(value) for value in args.data_overlaps]
+    OVERLAP_BASE = V3_DIAG_BASE + V3_DIAG_COUNT
     stats = torch.zeros(
-        V3_DIAG_BASE + V3_DIAG_COUNT,
+        OVERLAP_BASE + 2 * len(overlap_values),
         device=device,
         dtype=torch.float64,
     )
@@ -158,6 +160,8 @@ def evaluate(model, loader, device, args):
             return_completion=True,
             registration_target_xyz=registration_target_xyz,
             freeze_completion=True,
+            partial_mask=batch.get("partial_mask"),
+            overlap=batch.get("overlap"),
         )
         pred = out["pred_xyz"]
         pred_stages = out["pred_stages_xyz"]
@@ -248,6 +252,22 @@ def evaluate(model, loader, device, args):
                 torch.linalg.vector_norm(motion, dim=-1).sum().double()
             )
 
+        final_squared = (pred.float() - gt.float()).square().sum(dim=-1)
+        for overlap_index, overlap_value in enumerate(overlap_values):
+            selected = torch.isclose(
+                batch["overlap"].float(),
+                batch["overlap"].new_tensor(overlap_value),
+                atol=1e-6,
+                rtol=0.0,
+            )
+            if selected.any():
+                stats[OVERLAP_BASE + 2 * overlap_index] += (
+                    final_squared[selected].sum().double()
+                )
+                stats[OVERLAP_BASE + 2 * overlap_index + 1] += (
+                    selected.sum().double() * points_per_sample
+                )
+
     # ---- all_reduce ----
     if is_dist:
         dist.all_reduce(stats, op=dist.ReduceOp.SUM)
@@ -286,6 +306,18 @@ def evaluate(model, loader, device, args):
     final_rmse = metrics[f"eval_{stage_names[-1]}_point_rmse"]
     metrics["eval_final_point_rmse"] = final_rmse
     metrics["eval_reg_point_rmse"] = final_rmse
+    for overlap_index, overlap_value in enumerate(overlap_values):
+        squared_sum = stats[OVERLAP_BASE + 2 * overlap_index]
+        overlap_point_count = stats[
+            OVERLAP_BASE + 2 * overlap_index + 1
+        ]
+        metrics[
+            f"eval_overlap_{overlap_value:.2f}_point_rmse"
+        ] = (
+            torch.sqrt(squared_sum / overlap_point_count).item()
+            if overlap_point_count.item() > 0
+            else float("nan")
+        )
 
     metrics["eval_v3_edge_error_mm"] = (
         stats[V3_DIAG_BASE] / sample_count

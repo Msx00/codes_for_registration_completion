@@ -191,6 +191,8 @@ def test(
                     else None
                 ),
                 freeze_completion=True,
+                partial_mask=batch.get("partial_mask"),
+                overlap=batch.get("overlap"),
             )
             pred = out["pred_xyz"]
             completed = out["completed_xyz"]
@@ -339,8 +341,14 @@ def main():
         collate_fn=collate_fn,
     )
 
+    checkpoint_completion_map = checkpoint_config.get(
+        "completion_checkpoint_map", {}
+    )
     model = LiverV3Model(
-        completion_checkpoint=args.completion_checkpoint,
+        completion_checkpoint=(
+            "" if checkpoint_completion_map else args.completion_checkpoint
+        ),
+        completion_checkpoint_map=checkpoint_completion_map,
         global_match_level=int(checkpoint_config.get("global_match_level", 4)),
         global_match_dim=int(checkpoint_config.get("global_match_dim", 64)),
         num_refinement_steps=int(
