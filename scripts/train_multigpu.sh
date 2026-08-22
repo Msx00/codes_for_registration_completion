@@ -17,10 +17,10 @@ EPOCHS="${EPOCHS:-300}"
 BATCH_SIZE="${BATCH_SIZE:-4}"
 NUM_WORKERS="${NUM_WORKERS:-0}"
 
-TRAIN_STAGE="${TRAIN_STAGE:-registration}"
-REGISTRATION_TARGET_MODE="${REGISTRATION_TARGET_MODE:-gt}"
+TRAIN_STAGE="${TRAIN_STAGE:-joint}"
+REGISTRATION_TARGET_MODE="${REGISTRATION_TARGET_MODE:-completed}"
 COMPLETION_FROM_SCRATCH="${COMPLETION_FROM_SCRATCH:-0}"
-END_TO_END_COMPLETION="${END_TO_END_COMPLETION:-0}"
+END_TO_END_COMPLETION="${END_TO_END_COMPLETION:-1}"
 
 GLOBAL_MATCH_LEVEL="${GLOBAL_MATCH_LEVEL:-4}"
 GLOBAL_MATCH_DIM="${GLOBAL_MATCH_DIM:-64}"
@@ -32,7 +32,7 @@ V3_SPATIAL_TEMPERATURE="${V3_SPATIAL_TEMPERATURE:-1.0}"
 SOURCE_GRAPH_K="${SOURCE_GRAPH_K:-16}"
 
 LR="${LR:-1e-5}"
-COMPLETION_LR="${COMPLETION_LR:-0}"
+COMPLETION_LR="${COMPLETION_LR:-1e-6}"
 WEIGHT_DECAY="${WEIGHT_DECAY:-1e-5}"
 GRAD_CLIP="${GRAD_CLIP:-1.0}"
 
@@ -49,18 +49,33 @@ W_EDGE="${W_EDGE:-0.1}"
 EDGE_K="${EDGE_K:-8}"
 EDGE_BETA_MM="${EDGE_BETA_MM:-2.0}"
 W_PHYS="${W_PHYS:-0.0}"
-W_COMPLETION="${W_COMPLETION:-0.0}"
+W_COMPLETION="${W_COMPLETION:-0.1}"
 PHYS_K="${PHYS_K:-24}"
 PHYS_REG="${PHYS_REG:-1e-4}"
 DATA_OVERLAP="${DATA_OVERLAP:-0.25}"
+DATA_OVERLAPS="${DATA_OVERLAPS:-0.05,0.06,0.07,0.08,0.09,0.10,0.15,0.20,0.25,0.30}"
 AMP_DTYPE="${AMP_DTYPE:-fp32}"
 
 INIT_REGISTRATION_CHECKPOINT="${INIT_REGISTRATION_CHECKPOINT:-}"
-COMPLETION_CKPT="${COMPLETION_CKPT:-${PROJECT_DIR}/completion/logs/full_aug_20260805_013524/best.pth}"
+# Set COMPLETION_CKPT to use one legacy checkpoint for every sample. By
+# default, the ten specialized checkpoints below are routed by sample overlap.
+COMPLETION_CKPT="${COMPLETION_CKPT:-}"
+COMPLETION_RUN_SPECS=(
+  "0.05=full_aug_20260812_095734_overlap0.05"
+  "0.06=full_aug_20260812_214024_overlap0.06"
+  "0.07=full_aug_20260813_093558_overlap0.07"
+  "0.08=full_aug_20260813_093538_overlap0.08"
+  "0.09=full_aug_20260812_095539_overlap0.09"
+  "0.10=full_aug_20260811_104608_overlap0.10"
+  "0.15=full_aug_20260811_104624_overlap0.15"
+  "0.20=full_aug_20260811_105240_overlap0.20"
+  "0.25=full_aug_20260811_105310_overlap0.25"
+  "0.30=full_aug_20260811_105337_overlap0.30"
+)
 USE_WANDB="${USE_WANDB:-1}"
 WANDB_MODE="${WANDB_MODE:-offline}"
 WANDB_PROJECT="${WANDB_PROJECT:-msn_completion_biomech}"
-WANDB_RUN_NAME="${WANDB_RUN_NAME:-v3_registration}"
+WANDB_RUN_NAME="${WANDB_RUN_NAME:-v3_joint_routed}"
 
 die() {
   echo "[Error] $*" >&2
@@ -72,10 +87,24 @@ die() {
 [[ -d "${DATASET_ROOT}" ]] || die "dataset root not found: ${DATASET_ROOT}"
 [[ "${WORLD_SIZE}" =~ ^[1-9][0-9]*$ ]] || die "WORLD_SIZE must be a positive integer"
 (( WORLD_SIZE <= GPU_COUNT )) || die "WORLD_SIZE=${WORLD_SIZE} exceeds GPU_IDS count ${GPU_COUNT}"
+completion_checkpoint_args=()
 if [[ "${COMPLETION_FROM_SCRATCH}" == "1" ]]; then
   COMPLETION_CKPT=""
-else
+  completion_checkpoint_args+=(--completion_checkpoint "")
+elif [[ -n "${COMPLETION_CKPT}" ]]; then
   [[ -f "${COMPLETION_CKPT}" ]] || die "completion checkpoint not found: ${COMPLETION_CKPT}"
+  completion_checkpoint_args+=(--completion_checkpoint "${COMPLETION_CKPT}")
+else
+  completion_checkpoint_args+=(--completion_checkpoint "")
+  for spec in "${COMPLETION_RUN_SPECS[@]}"; do
+    overlap="${spec%%=*}"
+    run_name="${spec#*=}"
+    checkpoint="${PROJECT_DIR}/completion/logs/${run_name}/best.pth"
+    [[ -f "${checkpoint}" ]] || die "completion checkpoint not found: ${checkpoint}"
+    completion_checkpoint_args+=(
+      --completion_checkpoint_map "${overlap}=${checkpoint}"
+    )
+  done
 fi
 if [[ -n "${INIT_REGISTRATION_CHECKPOINT}" ]]; then
   [[ -f "${INIT_REGISTRATION_CHECKPOINT}" ]] || die "registration checkpoint not found: ${INIT_REGISTRATION_CHECKPOINT}"
@@ -107,6 +136,7 @@ args=(
   --weight_decay "${WEIGHT_DECAY}"
   --grad_clip "${GRAD_CLIP}"
   --data_overlap "${DATA_OVERLAP}"
+  --data_overlaps "${DATA_OVERLAPS}"
   --max_train_samples "${MAX_TRAIN_SAMPLES}"
   --max_val_samples "${MAX_VAL_SAMPLES}"
   --train_stage "${TRAIN_STAGE}"
@@ -135,10 +165,10 @@ args=(
   --phys_reg "${PHYS_REG}"
   --w_completion "${W_COMPLETION}"
   --amp_dtype "${AMP_DTYPE}"
-  --completion_checkpoint "${COMPLETION_CKPT}"
   --wandb_project "${WANDB_PROJECT}"
   --wandb_run_name "${WANDB_RUN_NAME}"
 )
+args+=("${completion_checkpoint_args[@]}")
 
 [[ "${DEBUG_REFINEMENT}" == "1" ]] && args+=(--debug_refinement)
 [[ "${COMPLETION_FROM_SCRATCH}" == "1" ]] && args+=(--completion_from_scratch) || args+=(--no-completion_from_scratch)
@@ -148,6 +178,7 @@ args=(
 
 echo "[Info] project=${PROJECT_DIR} GPUs=${GPU_IDS} world_size=${WORLD_SIZE} port=${MASTER_PORT}"
 echo "[Info] stage=${TRAIN_STAGE} target=${REGISTRATION_TARGET_MODE} architecture=full2full_v3"
+echo "[Info] overlaps=${DATA_OVERLAPS} completion_routing=$([[ -z "${COMPLETION_CKPT}" ]] && echo specialized || echo single)"
 echo "[Info] dataset=${DATASET_ROOT} save_dir=${SAVE_DIR}"
 
 exec python -m liver2.training.train_multigpu "${args[@]}" "$@"

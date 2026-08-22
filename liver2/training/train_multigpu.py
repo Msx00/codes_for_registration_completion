@@ -331,6 +331,8 @@ def train_one_epoch(
                     return_completion=True,
                     registration_target_xyz=registration_target_xyz,
                     freeze_completion=(args.train_stage == "registration"),
+                    partial_mask=batch["partial_mask"],
+                    overlap=batch["overlap"],
                 )
                 pred = out["pred_xyz"]
                 pred_stages = out["pred_stages_xyz"]
@@ -410,13 +412,9 @@ def train_one_epoch(
                 else:
                     L_phys = torch.tensor(0.0, device=device)
 
-                # --- completion loss (logging only in registration mode) ---
+                # --- completion loss (optimized in joint mode, logged otherwise) ---
                 if completion_outputs is not None:
-                    partial_mask = torch.ones(
-                        batch["part_xyz"].shape[:2],
-                        dtype=torch.bool,
-                        device=device,
-                    )
+                    partial_mask = batch["partial_mask"]
                     completion_losses = completion_criterion(
                         completion_outputs,
                         batch["gt_xyz"],
@@ -465,16 +463,19 @@ def train_one_epoch(
                 p for p in model.parameters()
                 if id(p) in completion_param_ids and p.requires_grad
             ]
-            local_nonfinite = not _gradients_are_finite(reg_params)
+            local_nonfinite = (
+                not _gradients_are_finite(reg_params)
+                or not _gradients_are_finite(comp_params)
+            )
             nonfinite_flag = torch.tensor(
                 int(local_nonfinite),
                 device=device,
                 dtype=torch.int32,
             )
             dist.all_reduce(nonfinite_flag, op=dist.ReduceOp.MAX)
-            nonfinite_registration_gradients = bool(nonfinite_flag.item())
+            nonfinite_model_gradients = bool(nonfinite_flag.item())
 
-            if nonfinite_registration_gradients:
+            if nonfinite_model_gradients:
                 consecutive_nonfinite += 1
                 reg_grad_norm = 0.0
                 comp_grad_norm = (
@@ -487,12 +488,12 @@ def train_one_epoch(
                     scaler.update()
                 if rank == 0:
                     print(
-                        "[Warning] Non-finite registration gradients; "
+                        "[Warning] Non-finite model gradients; "
                         f"skipped optimizer step (consecutive={consecutive_nonfinite})"
                     )
                 if consecutive_nonfinite >= 3:
                     raise FatalTrainingError(
-                        "Non-finite registration gradients in 3 consecutive "
+                        "Non-finite model gradients in 3 consecutive "
                         "batches. Terminating training to avoid silent divergence."
                     )
             else:
@@ -547,7 +548,7 @@ def train_one_epoch(
                 meters[offset + 5] += batch_size * point_count_per_sample
                 meters[offset + 6] += confidence_count
                 meters[offset + 7] += 1
-                meters[offset + 8] += int(nonfinite_registration_gradients)
+                meters[offset + 8] += int(nonfinite_model_gradients)
 
                 # Learned V3 matcher score mixture.
                 score_weights = out.get("score_weights")
@@ -824,6 +825,7 @@ def main_worker(rank, world_size, args_dict):
         torch.manual_seed(42)  # 确保模型初始化一致
         model = LiverV3Model(
             completion_checkpoint=args.completion_checkpoint,
+            completion_checkpoint_map=args.completion_checkpoint_map,
             completion_from_scratch=args.completion_from_scratch,
             end_to_end_completion=args.end_to_end_completion,
             global_match_level=args.global_match_level,
@@ -1117,6 +1119,12 @@ def main_worker(rank, world_size, args_dict):
                     f"sw_feat={eval_metrics.get('score_weight_feature', 0):.3f} "
                     f"sw_geom={eval_metrics.get('score_weight_geometry', 0):.3f}"
                 )
+                overlap_eval_text = " ".join(
+                    f"{overlap:.2f}="
+                    f"{eval_metrics[f'eval_overlap_{overlap:.2f}_point_rmse']:.4f}mm"
+                    for overlap in args.data_overlaps
+                )
+                print(f"[EvalOverlap] {overlap_eval_text}")
 
                 v3_diag = (
                     "[V3Diag] "
@@ -1189,6 +1197,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--dataset_root', type=str, default="/home/ma_sx/Project/Dataset/MedShapeNet-Liver")
     ap.add_argument('--data_overlap', type=float, default=0.8)
+    ap.add_argument('--data_overlaps', type=parse_float_list, default=None,
+                    help='Comma-separated discrete overlaps; supersedes --data_overlap')
     ap.add_argument('--max_train_samples', type=int, default=-1)
     ap.add_argument('--max_val_samples', type=int, default=100)
 
@@ -1217,6 +1227,13 @@ def main():
             PROJECT_ROOT
             / 'completion/logs/full_aug_20260805_013524/best.pth'
         ),
+    )
+    ap.add_argument(
+        '--completion_checkpoint_map',
+        action='append',
+        default=[],
+        metavar='OVERLAP=PATH',
+        help='Repeat once per overlap to route samples to specialized checkpoints',
     )
     ap.add_argument('--completion_from_scratch', default=False,
                     action=argparse.BooleanOptionalAction)
@@ -1266,6 +1283,48 @@ def main():
     ap.add_argument('--wandb_init_timeout', type=int, default=120)
     
     args = ap.parse_args()
+    parsed_checkpoint_map = {}
+    for item in args.completion_checkpoint_map:
+        try:
+            overlap_text, checkpoint_path = item.split('=', 1)
+            overlap = float(overlap_text)
+        except (ValueError, TypeError):
+            ap.error(
+                '--completion_checkpoint_map entries must use OVERLAP=PATH'
+            )
+        if overlap in parsed_checkpoint_map:
+            ap.error(f'duplicate completion checkpoint overlap: {overlap}')
+        parsed_checkpoint_map[overlap] = checkpoint_path
+    args.completion_checkpoint_map = parsed_checkpoint_map
+    if args.data_overlaps is None:
+        args.data_overlaps = [args.data_overlap]
+    if any(not 0 < value <= 1 for value in args.data_overlaps):
+        ap.error('--data_overlaps values must lie inside (0, 1]')
+    if len(set(args.data_overlaps)) != len(args.data_overlaps):
+        ap.error('--data_overlaps cannot contain duplicates')
+    if args.completion_checkpoint and args.completion_checkpoint_map:
+        ap.error(
+            '--completion_checkpoint and --completion_checkpoint_map are '
+            'mutually exclusive'
+        )
+    if args.completion_checkpoint_map:
+        missing_routes = set(args.data_overlaps) - set(
+            args.completion_checkpoint_map
+        )
+        extra_routes = set(args.completion_checkpoint_map) - set(
+            args.data_overlaps
+        )
+        if missing_routes or extra_routes:
+            ap.error(
+                'completion checkpoint routes must exactly match data overlaps; '
+                f'missing={sorted(missing_routes)}, extra={sorted(extra_routes)}'
+            )
+        missing_files = [
+            path for path in args.completion_checkpoint_map.values()
+            if not os.path.isfile(path)
+        ]
+        if missing_files:
+            ap.error(f'completion checkpoints not found: {missing_files}')
     if args.global_match_level not in (0, 1, 2, 3, 4):
         ap.error('--global_match_level must be one of 0,1,2,3,4')
     if args.global_match_dim < 1:
@@ -1290,13 +1349,17 @@ def main():
             'and every non-final refinement stage; expected '
             f'{args.num_refinement_steps}, got {len(args.aux_stage_weights)}'
         )
-    if args.completion_from_scratch and args.completion_checkpoint:
+    if args.completion_from_scratch and (
+        args.completion_checkpoint or args.completion_checkpoint_map
+    ):
         ap.error(
-            '--completion_from_scratch cannot be combined with a non-empty '
-            '--completion_checkpoint'
+            '--completion_from_scratch cannot be combined with completion '
+            'checkpoints'
         )
-    if not args.completion_from_scratch and not os.path.isfile(
-        args.completion_checkpoint
+    if (
+        not args.completion_from_scratch
+        and not args.completion_checkpoint_map
+        and not os.path.isfile(args.completion_checkpoint)
     ):
         ap.error(
             f"completion checkpoint not found: {args.completion_checkpoint}"

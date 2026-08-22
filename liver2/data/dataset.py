@@ -79,7 +79,17 @@ class LiverCompletionDataset(torch.utils.data.Dataset):
         self.root = Path(root)
         self.subfolders = subfolders
         self.cases = {"train": [], "validation": [], "test": []}
-        self.data_overlap = args.data_overlap  # 定义数据重叠比例
+        configured_overlaps = getattr(args, "data_overlaps", None)
+        if configured_overlaps:
+            self.data_overlaps = tuple(float(value) for value in configured_overlaps)
+        else:
+            self.data_overlaps = (float(args.data_overlap),)
+        if any(not 0 < value <= 1 for value in self.data_overlaps):
+            raise ValueError("Every data overlap must lie inside (0, 1]")
+        if len(set(self.data_overlaps)) != len(self.data_overlaps):
+            raise ValueError("data_overlaps cannot contain duplicates")
+        # Kept for callers that still inspect the historical scalar field.
+        self.data_overlap = self.data_overlaps[0]
         self.seed = int(getattr(args, "seed", 42))
         self.train_crops_per_gt = int(
             getattr(args, "train_crops_per_gt", 1)
@@ -189,14 +199,14 @@ class LiverCompletionDataset(torch.utils.data.Dataset):
                 "Effective train samples per epoch: "
                 f"{len(self.cases['train'])} cases x "
                 f"{self.train_crops_per_gt} crops = "
-                f"{len(self.cases['train']) * self.train_crops_per_gt}"
+                f"{len(self.cases['train']) * self.train_crops_per_gt}; "
+                f"cycling across {len(self.data_overlaps)} overlaps"
             )
 
     def __len__(self):
         return sum(
-            len(cases) * (
-                self.train_crops_per_gt if split == "train" else 1
-            )
+            len(cases)
+            * (self.train_crops_per_gt if split == "train" else 1)
             for split, cases in self.cases.items()
         )
 
@@ -401,6 +411,17 @@ class LiverCompletionDataset(torch.utils.data.Dataset):
             split_sample_count = len(cases) * crops_per_case
             if idx < split_sample_count:
                 case_idx, crop_view_idx = divmod(idx, crops_per_case)
+                # Keep every epoch balanced across the configured discrete
+                # overlaps without multiplying its length. Training cases
+                # rotate to the next overlap each epoch; validation/test use
+                # a fixed assignment so their metrics remain reproducible.
+                overlap_epoch_offset = self.epoch if split == "train" else 0
+                overlap_idx = (
+                    case_idx * crops_per_case
+                    + crop_view_idx
+                    + overlap_epoch_offset
+                ) % len(self.data_overlaps)
+                sample_overlap = self.data_overlaps[overlap_idx]
                 case_folder = cases[case_idx]
                 
                 # --- 2. 您的 __getitem__ 逻辑 ---
@@ -451,7 +472,7 @@ class LiverCompletionDataset(torch.utils.data.Dataset):
                 # (不再加载 target.txt)
                 target_size = max(
                     1,
-                    int(round(self.data_overlap * len(gt))),
+                    int(round(sample_overlap * len(gt))),
                 )
 
                 if split == "train":
@@ -535,6 +556,7 @@ class LiverCompletionDataset(torch.utils.data.Dataset):
 
                 return {
                     "src_xyz": source, "part_xyz": target, "gt_xyz": gt,
+                    "overlap": sample_overlap,
                     "E_kPa": E_kPa, "nu": nu,
                     "split": split,
                     "abdominal_f0":abdominal_f0, "abdominal_f1":abdominal_f1,
@@ -565,7 +587,7 @@ def collate_fn(batch, src_max_n=None):
         return torch.from_numpy(pc)
 
     src_list, part_list, gt_list = [], [], []
-    E_list, nu_list = [], []
+    E_list, nu_list, overlap_list = [], [], []
 
     for item in batch:
         src = to_tensor(item["src_xyz"])
@@ -590,25 +612,20 @@ def collate_fn(batch, src_max_n=None):
 
         E_list.append([item["E_kPa"]])
         nu_list.append([item["nu"]])
+        overlap_list.append(item["overlap"])
         
-    # Do not repeat the observed partial cloud to 1024/2048 points.
-    # Normally every sample already has round(data_overlap * 2048) points
-    # (410 points for overlap=0.2). If a rare batch contains different source
-    # sizes, crop all partials to the smallest real size without replacement.
-    part_n = min(part.shape[0] for part in part_list)
+    # Mixed-overlap batches have different real partial sizes. Pad instead of
+    # cropping so a 30% sample does not silently become a 5% sample merely
+    # because both occur in the same batch.
+    part_n = max(part.shape[0] for part in part_list)
+    part_tensor = part_list[0].new_zeros((B, part_n, part_list[0].shape[-1]))
+    partial_mask = torch.zeros((B, part_n), dtype=torch.bool)
     for i, part in enumerate(part_list):
-        if part.shape[0] > part_n:
-            # Evenly spaced deterministic indices avoid introducing new
-            # validation randomness while preserving unique points.
-            idx = torch.linspace(
-                0,
-                part.shape[0] - 1,
-                steps=part_n,
-            ).round().long()
-            part_list[i] = part[idx]
+        part_tensor[i, : part.shape[0]] = part
+        partial_mask[i, : part.shape[0]] = True
 
     src_tensor  = torch.stack(src_list, dim=0).float()
-    part_tensor = torch.stack(part_list, dim=0).float()
+    part_tensor = part_tensor.float()
     gt_tensor  = torch.stack(gt_list, dim=0).float()
 
     E = torch.tensor(E_list, dtype=torch.float32)
@@ -616,6 +633,8 @@ def collate_fn(batch, src_max_n=None):
 
     return {
         "src_xyz": src_tensor, "part_xyz": part_tensor, "gt_xyz": gt_tensor,
+        "partial_mask": partial_mask,
+        "overlap": torch.tensor(overlap_list, dtype=torch.float32),
         "E_kPa": E, "nu": nu
     }
 

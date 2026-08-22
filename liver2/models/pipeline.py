@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from .girnet.backbone_v3 import PV2SNetFull2FullV3
 from completion.SPAQNet.models.liver_generative_completion import (
@@ -11,6 +12,7 @@ class LiverV3Model(nn.Module):
     def __init__(
         self,
         completion_checkpoint="",
+        completion_checkpoint_map=None,
         completion_from_scratch=False,
         end_to_end_completion=False,
         global_match_level=4,
@@ -27,6 +29,13 @@ class LiverV3Model(nn.Module):
         self.end_to_end_completion = bool(end_to_end_completion)
         self.completion = None
         self.completion_config = {}
+        self._completion_routes = {}
+        completion_checkpoint_map = dict(completion_checkpoint_map or {})
+        if completion_checkpoint and completion_checkpoint_map:
+            raise ValueError(
+                "Use either completion_checkpoint or completion_checkpoint_map, "
+                "not both"
+            )
         if completion_checkpoint and completion_from_scratch:
             raise ValueError(
                 "completion_checkpoint and completion_from_scratch are "
@@ -42,6 +51,37 @@ class LiverV3Model(nn.Module):
             print(
                 "[Info] Initialized trainable SPAQNet completion model from "
                 f"scratch; trainable={trainable:,}/{trainable:,}"
+            )
+        elif completion_checkpoint_map:
+            self.completion = nn.ModuleDict()
+            reference_config = None
+            for overlap, checkpoint_path in sorted(completion_checkpoint_map.items()):
+                overlap = float(overlap)
+                route_key = self._route_key(overlap)
+                if route_key in self.completion:
+                    raise ValueError(f"Duplicate completion route for overlap={overlap}")
+                expert, config = self._load_completion_checkpoint(
+                    checkpoint_path,
+                    return_config=True,
+                )
+                if reference_config is None:
+                    reference_config = config
+                elif self._architecture_config(config) != self._architecture_config(
+                    reference_config
+                ):
+                    raise ValueError(
+                        "All routed completion checkpoints must use the same "
+                        "architecture"
+                    )
+                self.completion[route_key] = expert
+                self._completion_routes[self._overlap_id(overlap)] = route_key
+            self.completion_config = dict(reference_config or {})
+            print(
+                "[Info] Completion routing overlaps: "
+                + ", ".join(
+                    f"{overlap_id / 1_000_000:.2f}"
+                    for overlap_id in sorted(self._completion_routes)
+                )
             )
         elif completion_checkpoint:
             self.completion = self._load_completion_checkpoint(
@@ -83,7 +123,25 @@ class LiverV3Model(nn.Module):
         self.completion_config = config
         return completion
 
-    def _load_completion_checkpoint(self, checkpoint_path):
+    @staticmethod
+    def _overlap_id(overlap):
+        return int(round(float(overlap) * 1_000_000))
+
+    @classmethod
+    def _route_key(cls, overlap):
+        return f"overlap_{cls._overlap_id(overlap):07d}"
+
+    @staticmethod
+    def _architecture_config(config):
+        keys = (
+            "architecture", "feature_dim", "num_heads", "k_neighbors",
+            "context_points", "num_points", "coarse_points",
+            "encoder_depth", "decoder_depth", "denoise_queries",
+            "denoise_jitter",
+        )
+        return tuple((key, config.get(key)) for key in keys)
+
+    def _load_completion_checkpoint(self, checkpoint_path, return_config=False):
         checkpoint = torch.load(checkpoint_path, map_location="cpu")
         if not isinstance(checkpoint, dict) or "model" not in checkpoint:
             raise ValueError(
@@ -110,7 +168,69 @@ class LiverV3Model(nn.Module):
             f"{checkpoint_path}; epoch={checkpoint.get('epoch', -1) + 1}; "
             f"trainable={trainable:,}/{total:,}"
         )
+        if return_config:
+            return completion, config
         return completion
+
+    def _run_completion(self, src_xyz, part_xyz, partial_mask, overlap):
+        if not isinstance(self.completion, nn.ModuleDict):
+            return self.completion(src_xyz, part_xyz, partial_mask)
+        if overlap is None:
+            raise ValueError("overlap is required for routed completion checkpoints")
+        if overlap.ndim != 1 or overlap.shape[0] != src_xyz.shape[0]:
+            raise ValueError("overlap must have shape (batch_size,)")
+
+        routed_outputs = []
+        routed_indices = []
+        overlap_ids = torch.round(overlap.detach().float() * 1_000_000).long()
+        for overlap_id_tensor in torch.unique(overlap_ids, sorted=True):
+            overlap_id = int(overlap_id_tensor.item())
+            route_key = self._completion_routes.get(overlap_id)
+            if route_key is None:
+                available = [
+                    value / 1_000_000 for value in sorted(self._completion_routes)
+                ]
+                raise ValueError(
+                    f"No completion checkpoint for overlap={overlap_id / 1_000_000}; "
+                    f"available={available}"
+                )
+            indices = torch.where(overlap_ids == overlap_id_tensor)[0]
+            routed_indices.append(indices)
+            routed_outputs.append(
+                self.completion[route_key](
+                    src_xyz.index_select(0, indices),
+                    part_xyz.index_select(0, indices),
+                    partial_mask.index_select(0, indices),
+                )
+            )
+
+        concatenated_indices = torch.cat(routed_indices, dim=0)
+        restore_order = torch.argsort(concatenated_indices)
+        merged = {}
+        for key in routed_outputs[0]:
+            values = [output[key] for output in routed_outputs]
+            if values[0] is None:
+                merged[key] = None
+            else:
+                # The number of adaptive ranking candidates depends on the
+                # real partial size: 5%, 6%, and >=7% overlap produce 486,
+                # 507, and 512 candidates respectively. This tensor is only a
+                # diagnostic output, but pad it so mixed-overlap batches can
+                # still be restored to their original sample order.
+                if key == "ranking_scores":
+                    max_candidates = max(value.shape[1] for value in values)
+                    values = [
+                        F.pad(
+                            value,
+                            (0, max_candidates - value.shape[1]),
+                            value=float("-inf"),
+                        )
+                        for value in values
+                    ]
+                merged[key] = torch.cat(values, dim=0).index_select(
+                    0, restore_order
+                )
+        return merged
 
     @staticmethod
     def _normalize_for_GIRNet(src_xyz, part_xyz, eps=1e-6):
@@ -191,19 +311,20 @@ class LiverV3Model(nn.Module):
         return_completion=False,
         registration_target_xyz=None,
         freeze_completion=True,
+        partial_mask=None,
+        overlap=None,
     ):
         completion_outputs = None
         completed_xyz = part_xyz  # fallback when completion is absent
         if self.completion is not None:
-            partial_mask = torch.ones(
-                part_xyz.shape[:2],
-                dtype=torch.bool,
-                device=part_xyz.device,
-            )
-            completion_outputs = self.completion(
-                src_xyz,
-                part_xyz,
-                partial_mask,
+            if partial_mask is None:
+                partial_mask = torch.ones(
+                    part_xyz.shape[:2],
+                    dtype=torch.bool,
+                    device=part_xyz.device,
+                )
+            completion_outputs = self._run_completion(
+                src_xyz, part_xyz, partial_mask, overlap
             )
             completed_xyz = completion_outputs["completed_xyz"]
             if freeze_completion or not self.end_to_end_completion:
